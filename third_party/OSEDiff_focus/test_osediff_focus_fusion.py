@@ -11,7 +11,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT
-from osediff_focus_fusion import FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint
+from osediff_focus_fusion import FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint, move_scheduler_to_device
 
 
 def parse_args(argv=None):
@@ -25,11 +25,14 @@ def parse_args(argv=None):
     p.add_argument("--run_all_ablations", action="store_true")
     p.add_argument("--vae_encode_mode", choices=["sample", "mode"], default="mode")
     p.add_argument("--prompt_mode", choices=["fixed", "metadata"], default="fixed")
+    p.add_argument("--cache_fixed_prompt_embedding", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--keep_a_composite", action="store_true"); p.add_argument("--keep_threshold", type=float, default=.5)
     p.add_argument("--keep_soft_width", type=float, default=.1); p.add_argument("--seed", type=int, default=123)
     p.add_argument("--mixed_precision", choices=["fp16", "bf16", "fp32"], default="fp16")
     p.add_argument("--tiled", action="store_true"); p.add_argument("--latent_tiled_size", type=int, default=96)
     p.add_argument("--latent_tiled_overlap", type=int, default=32)
+    p.add_argument("--native_resolution", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--strict_native_size", action=argparse.BooleanOptionalAction, default=True)
     return p.parse_args(argv)
 
 
@@ -56,8 +59,12 @@ def main(args):
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.mixed_precision]
     if device.type == "cpu": dtype = torch.float32
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
-    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
-    text = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
+    cached_prompt = state.get("fixed_prompt_embedding")
+    have_cached_prompt = args.prompt_mode == "fixed" and args.cache_fixed_prompt_embedding and cached_prompt is not None and cached_prompt.numel()
+    tokenizer = text = None
+    if not have_cached_prompt:
+        tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+        text = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     expand_unet_conv_in(unet, state["generator_in_channels"])
@@ -78,18 +85,24 @@ def main(args):
         vae.add_adapter(LoraConfig(r=int(state.get("rank_vae") or rank), target_modules=targets), adapter_name="focus_vae_encoder")
         vae.set_adapter(["focus_vae_encoder"])
     scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler"); scheduler.set_timesteps(1, device=device)
+    move_scheduler_to_device(scheduler, device)
     model = FocusFusionGenerator(unet, vae, scheduler, state["condition_mode"])
     load_focus_checkpoint(model, state)
     if vae_lora_state:
         result = model.vae.load_state_dict(vae_lora_state, strict=False)
         print("VAE missing keys:", result.missing_keys, "unexpected keys:", result.unexpected_keys)
-    model.to(device, dtype=dtype).eval(); text.to(device, dtype=dtype).eval()
+    model.to(device, dtype=dtype).eval()
+    if text is not None:
+        text.to(device, dtype=dtype).eval()
     dataset = FocusFusionDataset(args.metadata_path, args.dataset_base_path, args.resolution,
-        max_samples=args.max_samples, start_index=args.start_index, prompt_mode=args.prompt_mode)
+        max_samples=args.max_samples, start_index=args.start_index, prompt_mode=args.prompt_mode,
+        native_resolution=args.native_resolution, strict_native_size=args.strict_native_size)
 
     def embeds(prompts):
         cached = model.fixed_prompt_embedding
         if args.prompt_mode == "fixed" and cached.numel(): return cached.to(device, dtype=dtype).expand(len(prompts), -1, -1)
+        if tokenizer is None or text is None:
+            raise RuntimeError("fixed prompt embedding is absent; tokenizer/text encoder must be available")
         ids = tokenizer(prompts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(device)
         return text(ids)[0]
     modes = ["normal", "b_equals_a", "b_zero"] if args.run_all_ablations else [args.condition_ablation]
@@ -99,18 +112,32 @@ def main(args):
         for batch in DataLoader(dataset, batch_size=1, shuffle=False):
             a, b = batch["a"].to(device, dtype=dtype), batch["b_warp"].to(device, dtype=dtype)
             fa, fb = batch["focus_a"].to(device, dtype=dtype), batch["focus_b_warp"].to(device, dtype=dtype)
-            if mode == "b_equals_a": b = a.clone()
-            elif mode == "b_zero": b, fb = torch.zeros_like(b), torch.zeros_like(fb)
+            z_b_override = None
+            if mode == "b_equals_a":
+                b, fb = a.clone(), fa.clone()
+                with torch.no_grad():
+                    z_a, _ = model.encode_images(a, a, args.vae_encode_mode)
+                z_b_override = z_a
+            elif mode == "b_zero":
+                b, fb = torch.zeros_like(b), torch.zeros_like(fb)
+                with torch.no_grad():
+                    z_a, _ = model.encode_images(a, a, args.vae_encode_mode)
+                z_b_override = torch.zeros_like(z_a)
             with torch.no_grad(): raw, _, _ = model(a, b, fa, fb, embeds(batch["prompt"]), args.vae_encode_mode,
-                args.tiled, args.latent_tiled_size, args.latent_tiled_overlap)
+                args.tiled, args.latent_tiled_size, args.latent_tiled_overlap, z_b_override=z_b_override)
             keep_mask = soft_keep(fa, args.keep_threshold, args.keep_soft_width)
             final = keep_mask * a + (1 - keep_mask) * raw if args.keep_a_composite else raw
             idx = int(batch["metadata_index"].item()); folder = out_root / f"{idx:06d}"; folder.mkdir(exist_ok=True)
-            images = {"pred_raw.png": _pil(raw), "pred_keepa_composite.png": _pil(keep_mask * a + (1 - keep_mask) * raw), "A.png": _pil(a),
+            images = {"pred_raw.png": _pil(raw), "final.png": _pil(final), "A.png": _pil(a),
                       "B_warp.png": _pil(b), "GT.png": _pil(batch["gt"]), "focus_A.png": _pil(fa, True),
                       "focus_B_warp.png": _pil(fb, True)}
+            if args.keep_a_composite:
+                images["pred_keepa_composite.png"] = _pil(final)
             for name, image in images.items(): image.save(folder / name)
-            panels = [images[n].convert("RGB") for n in ("A.png", "B_warp.png", "GT.png", "pred_raw.png", "pred_keepa_composite.png")]
+            panel_names = ["A.png", "B_warp.png", "GT.png", "focus_A.png", "focus_B_warp.png", "pred_raw.png"]
+            if args.keep_a_composite:
+                panel_names.append("pred_keepa_composite.png")
+            panels = [images[n].convert("RGB") for n in panel_names]
             canvas = Image.new("RGB", (sum(x.width for x in panels), max(x.height for x in panels)))
             x = 0
             for panel in panels: canvas.paste(panel, (x, 0)); x += panel.width

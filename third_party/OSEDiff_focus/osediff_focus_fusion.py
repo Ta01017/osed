@@ -41,6 +41,12 @@ def condition_channels(mode):
     return 8 if mode == "ab" else 10
 
 
+def move_scheduler_to_device(scheduler, device):
+    if hasattr(scheduler, "alphas_cumprod"):
+        scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device)
+    return scheduler
+
+
 def masked_l1(pred, target, mask, eps=1e-6):
     mask = mask.clamp(0, 1)
     return ((pred - target).abs() * mask).sum() / (mask.sum() * pred.shape[1] + eps)
@@ -117,10 +123,14 @@ class FocusFusionGenerator(nn.Module):
         return value
 
     def forward(self, a, b, focus_a, focus_b, prompt_embeds, vae_encode_mode="sample",
-                tiled=False, tile_size=96, tile_overlap=32):
+                tiled=False, tile_size=96, tile_overlap=32, z_b_override=None):
         z_a, z_b = self.encode_images(a, b, vae_encode_mode)
+        if z_b_override is not None:
+            z_b = z_b_override.to(device=z_a.device, dtype=z_a.dtype)
         unet_input = self.make_unet_input(z_a, z_b, focus_a, focus_b)
         ts = self.timesteps.to(a.device)
+        if hasattr(self.scheduler, "alphas_cumprod") and self.scheduler.alphas_cumprod.device != z_a.device:
+            self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(z_a.device)
         if tiled:
             pred = tiled_unet_forward(self.unet, unet_input, ts, prompt_embeds, 4, tile_size, tile_overlap)
         else:
@@ -129,13 +139,16 @@ class FocusFusionGenerator(nn.Module):
         denoised = self.scheduler.step(pred, ts, z_a, return_dict=True).prev_sample
         assert denoised.shape[1] == 4
         output = self.vae.decode(denoised / self.vae.config.scaling_factor).sample.clamp(-1, 1)
+        if output.shape[-2:] != a.shape[-2:]:
+            output = F.interpolate(output, size=a.shape[-2:], mode="bilinear", align_corners=False).clamp(-1, 1)
         assert output.shape[1] == 3
         return output, denoised, pred
 
 
-def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None):
+def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd=None, accelerator=None):
     unet_state = {k: v.detach().cpu() for k, v in model.unet.state_dict().items() if "lora" in k}
-    return {"format_version": 1, "condition_mode": model.condition_mode,
+    input_mode = getattr(args, "input_mode", getattr(args, "condition_mode", model.condition_mode))
+    return {"format_version": 2, "input_mode": input_mode, "condition_mode": model.condition_mode,
             "generator_in_channels": model.unet.conv_in.in_channels,
             "generator_conv_in": copy.deepcopy(model.unet.conv_in.state_dict()),
             "generator_unet_lora": unet_state,
@@ -144,22 +157,38 @@ def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None):
             "vae_lora_targets": getattr(model, "focus_vae_lora_targets", []),
             "rank_vae": getattr(model, "lora_rank_vae", getattr(args, "lora_rank_unet", None)),
             "vae_lora": {k: v.detach().cpu() for k, v in model.vae.state_dict().items() if "lora" in k},
-            "fixed_prompt": FIXED_FUSION_PROMPT, "fixed_prompt_embedding": model.fixed_prompt_embedding.cpu(),
-            "training_step": int(step), "args": vars(args).copy(),
+            "vsd_unet_lora": {k: v.detach().cpu() for k, v in vsd.unet_update.state_dict().items() if "lora" in k} if vsd is not None else {},
+            "vsd_lora_targets": getattr(vsd, "lora_unet_modules_encoder", []) + getattr(vsd, "lora_unet_modules_decoder", []) + getattr(vsd, "lora_unet_others", []) if vsd is not None else [],
+            "fixed_prompt": FIXED_FUSION_PROMPT,
+            "cache_fixed_prompt_embedding": bool(getattr(args, "cache_fixed_prompt_embedding", True)),
+            "fixed_prompt_embedding": model.fixed_prompt_embedding.cpu(),
+            "training_step": int(step), "global_step": int(step),
+            "gradient_accumulation_steps": int(getattr(args, "gradient_accumulation_steps", 1)),
+            "args": vars(args).copy(),
             "optimizer": optimizer.state_dict() if optimizer else None,
             "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler else None}
 
 
 def load_focus_checkpoint(model, checkpoint, load_lora=True):
     state = torch.load(checkpoint, map_location="cpu") if isinstance(checkpoint, (str, bytes)) else checkpoint
+    if state.get("input_mode", state.get("condition_mode")) != model.condition_mode:
+        raise RuntimeError(f"input_mode mismatch: checkpoint={state.get('input_mode', state.get('condition_mode'))} model={model.condition_mode}")
     if model.unet.conv_in.in_channels != state["generator_in_channels"]:
         raise RuntimeError("model conv_in must be expanded before checkpoint loading")
     result = model.unet.conv_in.load_state_dict(state["generator_conv_in"], strict=True)
     print("conv_in missing keys:", result.missing_keys, "unexpected keys:", result.unexpected_keys)
     if result.missing_keys or result.unexpected_keys: raise RuntimeError("conv_in checkpoint load failed")
+    if "weight" not in state["generator_conv_in"] or ("bias" in model.unet.conv_in.state_dict() and "bias" not in state["generator_conv_in"]):
+        raise RuntimeError("checkpoint did not provide required conv_in weight/bias")
     if load_lora:
-        result = model.unet.load_state_dict(state.get("generator_unet_lora", {}), strict=False)
+        lora_state = state.get("generator_unet_lora", {})
+        result = model.unet.load_state_dict(lora_state, strict=False)
         print("UNet missing keys:", result.missing_keys, "unexpected keys:", result.unexpected_keys)
+        bad_unexpected = [k for k in result.unexpected_keys if "lora" in k]
+        loaded = set(lora_state)
+        missing_lora = [k for k in loaded if k not in model.unet.state_dict()]
+        if bad_unexpected or missing_lora:
+            raise RuntimeError(f"LoRA checkpoint load failed: unexpected={bad_unexpected} missing_lora={missing_lora}")
     if state.get("fixed_prompt_embedding") is not None:
         model.cache_prompt(state["fixed_prompt_embedding"])
     return state

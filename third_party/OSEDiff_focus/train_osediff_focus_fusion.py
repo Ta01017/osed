@@ -5,11 +5,12 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import DataLoader
 
 from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT
 from osediff_focus_fusion import (FocusFusionGenerator, checkpoint_payload, gradient_loss,
-                                  laplacian_loss, masked_l1)
+                                  laplacian_loss, masked_l1, move_scheduler_to_device)
 
 
 def parse_args(argv=None):
@@ -33,6 +34,12 @@ def parse_args(argv=None):
     p.add_argument("--max_train_steps", type=int, default=10000)
     p.add_argument("--checkpointing_steps", type=int, default=500)
     p.add_argument("--validation_steps", type=int, default=500)
+    p.add_argument("--validation_max_samples", type=int, default=4)
+    p.add_argument("--keep_a_composite", action="store_true")
+    p.add_argument("--keep_threshold", type=float, default=.5)
+    p.add_argument("--keep_soft_width", type=float, default=.1)
+    p.add_argument("--native_resolution", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--strict_native_size", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--lr_scheduler", type=str, default="constant")
     p.add_argument("--lr_warmup_steps", type=int, default=500)
@@ -101,13 +108,82 @@ def _groups(model, args, vsd=None):
         groups.append({"name": "vsd_lora", "params": [p for n, p in vsd.unet_update.named_parameters() if "lora" in n and p.requires_grad]})
     groups = [g for g in groups if g["params"]]
     ids = {id(p) for g in groups for p in g["params"]}
-    assert id(model.unet.conv_in.weight) in ids, "expanded conv_in weight is absent from optimizer"
+    if args.train_conv_in:
+        assert id(model.unet.conv_in.weight) in ids, "expanded conv_in weight is absent from optimizer"
+    else:
+        model.unet.conv_in.requires_grad_(False)
+        assert id(model.unet.conv_in.weight) not in ids, "conv_in was added while train_conv_in=false"
     total = 0
     for g in groups:
         count = sum(p.numel() for p in g["params"]); train = sum(p.numel() for p in g["params"] if p.requires_grad); total += train
         print(f"optimizer group {g['name']}: parameters={count:,}, requires_grad={train:,}")
     print(f"total trainable parameters: {total:,}")
     return groups
+
+
+def _pil(x, focus=False):
+    x = x.detach().float().cpu()[0]
+    if not focus:
+        x = x.mul(.5).add(.5)
+    a = x.clamp(0, 1).mul(255).byte().numpy()
+    if a.shape[0] == 1:
+        return Image.fromarray(a[0], "L")
+    return Image.fromarray(a.transpose(1, 2, 0), "RGB")
+
+
+def _soft_keep(mask, threshold, width):
+    if width <= 0:
+        return (mask >= threshold).to(mask.dtype)
+    return ((mask - (threshold - width / 2)) / width).clamp(0, 1)
+
+
+@torch.no_grad()
+def run_validation(model, loader, encode_fn, args, accelerator, step):
+    if not accelerator.is_main_process:
+        return
+    raw_model = accelerator.unwrap_model(model)
+    was_training = raw_model.training
+    raw_model.eval()
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    out_root = Path(args.output_dir, "validation", f"global_step_{step:06d}")
+    out_root.mkdir(parents=True, exist_ok=True)
+    for batch in loader:
+        prompts = batch["prompt"]
+        if args.prompt_mode == "fixed" and raw_model.fixed_prompt_embedding.numel():
+            emb = raw_model.fixed_prompt_embedding.to(accelerator.device).expand(len(prompts), -1, -1)
+        else:
+            emb = encode_fn(prompts, accelerator.device)
+        a = batch["a"].to(accelerator.device)
+        b = batch["b_warp"].to(accelerator.device)
+        gt = batch["gt"].to(accelerator.device)
+        fa = batch["focus_a"].to(accelerator.device)
+        fb = batch["focus_b_warp"].to(accelerator.device)
+        pred, _, _ = raw_model(a, b, fa, fb, emb, "mode")
+        keep = _soft_keep(fa, args.keep_threshold, args.keep_soft_width)
+        final = keep * a + (1 - keep) * pred if args.keep_a_composite else pred
+        idx = int(batch["metadata_index"].item())
+        folder = out_root / f"{idx:06d}"
+        folder.mkdir(parents=True, exist_ok=True)
+        images = {"A.png": _pil(a), "B_warp.png": _pil(b), "GT.png": _pil(gt),
+                  "focus_A.png": _pil(fa, True), "focus_B_warp.png": _pil(fb, True),
+                  "pred_raw.png": _pil(pred), "final.png": _pil(final)}
+        if args.keep_a_composite:
+            images["pred_keepa_composite.png"] = _pil(final)
+        for name, image in images.items():
+            image.save(folder / name)
+        panel_names = ["A.png", "B_warp.png", "GT.png", "focus_A.png", "focus_B_warp.png", "pred_raw.png"]
+        if args.keep_a_composite:
+            panel_names.append("pred_keepa_composite.png")
+        panels = [images[n].convert("RGB") for n in panel_names]
+        canvas = Image.new("RGB", (sum(p.width for p in panels), max(p.height for p in panels)))
+        x = 0
+        for panel in panels:
+            canvas.paste(panel, (x, 0)); x += panel.width
+        canvas.save(folder / "comparison.png")
+    if was_training:
+        raw_model.train()
 
 
 def main(args):
@@ -139,6 +215,7 @@ def main(args):
     for n, p in vae.named_parameters(): p.requires_grad_("lora" in n)
     scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     scheduler.set_timesteps(1, device=accelerator.device)
+    move_scheduler_to_device(scheduler, accelerator.device)
     model = FocusFusionGenerator(unet, vae, scheduler, args.condition_mode)
     assert model.unet.config.out_channels == 4
     model.focus_lora_targets = lora_targets
@@ -169,9 +246,15 @@ def main(args):
         ram_model.eval().to(accelerator.device, dtype=torch.float16)
 
     dataset = FocusFusionDataset(args.metadata_path, args.dataset_base_path, args.resolution,
-        args.random_crop, args.center_crop, args.random_flip, args.max_samples, args.start_index, args.smoke, args.prompt_mode)
+        args.random_crop, args.center_crop, args.random_flip, args.max_samples, args.start_index, args.smoke, args.prompt_mode,
+        args.native_resolution, args.strict_native_size)
+    val_dataset = FocusFusionDataset(args.metadata_path, args.dataset_base_path, args.resolution,
+        False, False, False, args.validation_max_samples, 0, False, args.prompt_mode,
+        args.native_resolution, args.strict_native_size)
     loader = DataLoader(dataset, args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    optimizer = torch.optim.AdamW(_groups(model, args, model_reg), lr=args.learning_rate)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
+    param_groups = _groups(model, args, model_reg)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate)
     lr_scheduler = get_scheduler(args.lr_scheduler, optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
@@ -180,15 +263,18 @@ def main(args):
     pending_lr_state = None
     if args.resume_from_checkpoint:
         state = load_focus_checkpoint(model, args.resume_from_checkpoint)
-        if state.get("optimizer"): optimizer.load_state_dict(state["optimizer"])
+        if state.get("optimizer"):
+            if len(state["optimizer"].get("param_groups", [])) != len(optimizer.param_groups):
+                raise RuntimeError("optimizer parameter group count mismatch during resume")
+            optimizer.load_state_dict(state["optimizer"])
         pending_lr_state = state.get("lr_scheduler")
-        start = state.get("training_step", 0)
+        start = state.get("global_step", state.get("training_step", 0))
     if pending_lr_state:
         lr_scheduler.load_state_dict(pending_lr_state)
     if model_reg is None:
-        model, text_encoder, optimizer, loader, lr_scheduler = accelerator.prepare(model, text_encoder, optimizer, loader, lr_scheduler)
+        model, text_encoder, optimizer, loader, val_loader, lr_scheduler = accelerator.prepare(model, text_encoder, optimizer, loader, val_loader, lr_scheduler)
     else:
-        model, model_reg, text_encoder, optimizer, loader, lr_scheduler = accelerator.prepare(model, model_reg, text_encoder, optimizer, loader, lr_scheduler)
+        model, model_reg, text_encoder, optimizer, loader, val_loader, lr_scheduler = accelerator.prepare(model, model_reg, text_encoder, optimizer, loader, val_loader, lr_scheduler)
     iterator = iter(loader)
     for step in range(start + 1, args.max_train_steps + 1):
         try: batch = next(iterator)
@@ -228,9 +314,12 @@ def main(args):
                 accelerator.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], args.max_grad_norm)
             optimizer.step(); lr_scheduler.step(); optimizer.zero_grad(set_to_none=True)
         if accelerator.is_main_process and (step == 1 or step % 10 == 0): print(step, {k: round(v.item(), 6) for k, v in losses.items()})
+        if args.validation_steps > 0 and step % args.validation_steps == 0:
+            run_validation(model, val_loader, encode, args, accelerator, step)
         if accelerator.is_main_process and step % args.checkpointing_steps == 0:
             raw = accelerator.unwrap_model(model)
-            torch.save(checkpoint_payload(raw, step, args, optimizer, lr_scheduler), Path(args.output_dir, "checkpoints", f"focus_fusion_{step}.pt"))
+            raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
+            torch.save(checkpoint_payload(raw, step, args, optimizer, lr_scheduler, raw_reg, accelerator), Path(args.output_dir, "checkpoints", f"focus_fusion_{step}.pt"))
 
 
 if __name__ == "__main__": main(parse_args())

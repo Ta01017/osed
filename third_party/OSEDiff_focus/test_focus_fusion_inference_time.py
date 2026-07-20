@@ -1,18 +1,123 @@
-"""Benchmark focus-fusion inference without RAM/DAPE overhead."""
-import argparse, time, torch
-from test_osediff_focus_fusion import parse_args as inference_args
+"""Benchmark focus-fusion inference.
+
+Default mode runs the real VAE encode -> UNet -> scheduler.step -> VAE decode path.
+Use --mock to run a clearly labelled shape-only Conv2d microbenchmark.
+"""
+import argparse
+import time
+
+import torch
+
+from osediff_focus_fusion import FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint, move_scheduler_to_device
+from test_osediff_focus_fusion import parse_args as infer_parse_args
+
 
 def parse_args():
-    p = argparse.ArgumentParser(); p.add_argument("--warmup_iterations", type=int, default=5); p.add_argument("--inference_iterations", type=int, default=100)
-    p.add_argument("--resolution", type=int, default=512); return p.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--mock", action="store_true")
+    p.add_argument("--warmup_iterations", type=int, default=5)
+    p.add_argument("--inference_iterations", type=int, default=50)
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--input_mode", choices=["ab", "ab_focus"], default="ab_focus")
+    p.add_argument("--tiled", action="store_true")
+    p.add_argument("--latent_tiled_size", type=int, default=96)
+    p.add_argument("--latent_tiled_overlap", type=int, default=32)
+    p.add_argument("--pretrained_model_name_or_path")
+    p.add_argument("--checkpoint_path")
+    p.add_argument("--mixed_precision", choices=["fp16", "bf16", "fp32"], default="fp16")
+    return p.parse_args()
+
+
+def _sync(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _peak(device):
+    if device.type != "cuda":
+        return 0.0
+    return torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+
+def run_mock(args, device):
+    channels = 10 if args.input_mode == "ab_focus" else 8
+    conv = torch.nn.Conv2d(channels, 4, 3, padding=1).to(device)
+    x = torch.randn(1, channels, args.height // 8, args.width // 8, device=device)
+    for _ in range(args.warmup_iterations):
+        conv(x)
+    _sync(device)
+    start = time.perf_counter()
+    for _ in range(args.inference_iterations):
+        conv(x)
+    _sync(device)
+    print(f"MOCK Conv2d-only time, not OSEDiff inference: {(time.perf_counter() - start) / args.inference_iterations:.6f}s")
+
+
+def run_real(args, device):
+    if not args.pretrained_model_name_or_path or not args.checkpoint_path:
+        raise ValueError("real benchmark requires --pretrained_model_name_or_path and --checkpoint_path")
+    from diffusers import DDPMScheduler
+    from models.autoencoder_kl import AutoencoderKL
+    from models.unet_2d_condition import UNet2DConditionModel
+
+    state = torch.load(args.checkpoint_path, map_location="cpu")
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.mixed_precision]
+    if device.type == "cpu":
+        dtype = torch.float32
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+    expand_unet_conv_in(unet, state["generator_in_channels"])
+    scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    scheduler.set_timesteps(1, device=device)
+    move_scheduler_to_device(scheduler, device)
+    model = FocusFusionGenerator(unet, vae, scheduler, state["condition_mode"])
+    load_focus_checkpoint(model, state)
+    model.to(device, dtype=dtype).eval()
+    a = torch.randn(1, 3, args.height, args.width, device=device, dtype=dtype).clamp(-1, 1)
+    b = torch.randn_like(a).clamp(-1, 1)
+    fa = torch.rand(1, 1, args.height, args.width, device=device, dtype=dtype)
+    fb = torch.rand_like(fa)
+    prompt = model.fixed_prompt_embedding
+    if not prompt.numel():
+        prompt = torch.zeros(1, 77, 1024)
+    prompt = prompt.to(device=device, dtype=dtype)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    phase = {"vae_encode": 0.0, "unet_one_step": 0.0, "scheduler_step": 0.0, "vae_decode": 0.0, "end_to_end": 0.0}
+    for i in range(args.warmup_iterations + args.inference_iterations):
+        _sync(device)
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            s = time.perf_counter(); z_a, z_b = model.encode_images(a, b, "mode"); _sync(device); e = time.perf_counter()
+            unet_input = model.make_unet_input(z_a, z_b, fa, fb)
+            ts = model.timesteps.to(device)
+            s2 = time.perf_counter()
+            if args.tiled:
+                from osediff_focus_fusion import tiled_unet_forward
+                pred = tiled_unet_forward(model.unet, unet_input, ts, prompt, 4, args.latent_tiled_size, args.latent_tiled_overlap)
+            else:
+                pred = model.unet(unet_input, ts, encoder_hidden_states=prompt).sample
+            _sync(device); e2 = time.perf_counter()
+            s3 = time.perf_counter(); den = model.scheduler.step(pred, ts, z_a, return_dict=True).prev_sample; _sync(device); e3 = time.perf_counter()
+            s4 = time.perf_counter(); model.vae.decode(den / model.vae.config.scaling_factor).sample; _sync(device); e4 = time.perf_counter()
+        t1 = time.perf_counter()
+        if i >= args.warmup_iterations:
+            phase["vae_encode"] += e - s
+            phase["unet_one_step"] += e2 - s2
+            phase["scheduler_step"] += e3 - s3
+            phase["vae_decode"] += e4 - s4
+            phase["end_to_end"] += t1 - t0
+    for key, value in phase.items():
+        print(f"{key}: {value / args.inference_iterations:.6f}s")
+    print(f"peak_memory_mb: {_peak(device):.2f}")
+    print(f"resolution: {args.height}x{args.width}, input_mode: {args.input_mode}, tiled: {args.tiled}")
+
 
 if __name__ == "__main__":
-    args = parse_args(); device = "cuda" if torch.cuda.is_available() else "cpu"
-    # This microbenchmark isolates the mandatory tensor path: 10ch input -> 4ch prediction/sample -> 3ch decode.
-    conv = torch.nn.Conv2d(10, 4, 3, padding=1).to(device); x = torch.randn(1, 10, args.resolution//8, args.resolution//8, device=device)
-    for _ in range(args.warmup_iterations): conv(x)
-    if device == "cuda": torch.cuda.synchronize()
-    start=time.perf_counter()
-    for _ in range(args.inference_iterations): conv(x)
-    if device == "cuda": torch.cuda.synchronize()
-    print(f"average generator UNet input-stage time: {(time.perf_counter()-start)/args.inference_iterations:.6f}s")
+    args = parse_args()
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.mock:
+        run_mock(args, dev)
+    else:
+        run_real(args, dev)

@@ -35,9 +35,12 @@ class FocusFusionDataset(Dataset):
 
     def __init__(self, metadata_path, dataset_base_path=None, resolution=512,
                  random_crop=False, center_crop=False, random_flip=False,
-                 max_samples=None, start_index=0, smoke=False, prompt_mode="fixed"):
+                 max_samples=None, start_index=0, smoke=False, prompt_mode="fixed",
+                 native_resolution=True, strict_native_size=True):
         if random_crop and center_crop:
             raise ValueError("random_crop and center_crop are mutually exclusive")
+        if native_resolution and (random_crop or center_crop):
+            raise ValueError("native_resolution forbids random_crop and center_crop")
         self.metadata_path = str(metadata_path)
         self.base = Path(dataset_base_path or Path(metadata_path).parent)
         self.resolution = int(resolution)
@@ -45,6 +48,8 @@ class FocusFusionDataset(Dataset):
         self.center_crop = bool(center_crop)
         self.random_flip = bool(random_flip)
         self.prompt_mode = prompt_mode
+        self.native_resolution = bool(native_resolution)
+        self.strict_native_size = bool(strict_native_size)
         records = _metadata_records(metadata_path)
         start = int(start_index)
         limit = 16 if smoke else max_samples
@@ -75,22 +80,24 @@ class FocusFusionDataset(Dataset):
             sizes = [im.size for im in images]
             raise ValueError(f"metadata index {index}: aligned inputs have different sizes: {sizes}")
 
-        # Resize the short side, then share exactly one crop/flip decision.
-        scale = max(self.resolution / w, self.resolution / h)
-        rw, rh = max(self.resolution, round(w * scale)), max(self.resolution, round(h * scale))
-        resized = []
-        for i, im in enumerate(images):
-            resized.append(im.resize((rw, rh), Image.Resampling.BILINEAR))
-        if self.random_crop:
-            left = random.randint(0, rw - self.resolution)
-            top = random.randint(0, rh - self.resolution)
-        else:  # center crop is also the deterministic default
-            left, top = (rw - self.resolution) // 2, (rh - self.resolution) // 2
-        box = (left, top, left + self.resolution, top + self.resolution)
         do_flip = self.random_flip and random.random() < 0.5
         arrays = []
-        for im in resized:
-            im = im.crop(box)
+        if self.native_resolution:
+            if self.strict_native_size and (w % 8 != 0 or h % 8 != 0):
+                raise ValueError(f"metadata index {index}: native image size must be divisible by 8, got {w}x{h}")
+            processed = images
+        else:
+            scale = max(self.resolution / w, self.resolution / h)
+            rw, rh = max(self.resolution, round(w * scale)), max(self.resolution, round(h * scale))
+            processed = [im.resize((rw, rh), Image.Resampling.BILINEAR) for im in images]
+            if self.random_crop:
+                left = random.randint(0, rw - self.resolution)
+                top = random.randint(0, rh - self.resolution)
+            else:
+                left, top = (rw - self.resolution) // 2, (rh - self.resolution) // 2
+            box = (left, top, left + self.resolution, top + self.resolution)
+            processed = [im.crop(box) for im in processed]
+        for im in processed:
             if do_flip:
                 im = im.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
             arrays.append(np.asarray(im, dtype=np.float32).copy())
@@ -107,4 +114,3 @@ class FocusFusionDataset(Dataset):
             "paths": {"gt": str(paths[0]), "a": str(paths[1]), "b_warp": str(paths[2]),
                       "focus_a": str(paths[3]), "focus_b_warp": str(paths[4])},
         }
-
