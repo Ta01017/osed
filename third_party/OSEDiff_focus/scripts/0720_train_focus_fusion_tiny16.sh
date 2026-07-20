@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
-GPU="${GPU:-0}"; MAX_STEPS="${MAX_STEPS:-2000}"; MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
+GPU="${GPU:-0}"; INPUT_MODE="${INPUT_MODE:-ab_focus}"; MAX_STEPS="${MAX_STEPS:-2000}"; MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"; GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+NATIVE_RESOLUTION="${NATIVE_RESOLUTION:-1}"; STRICT_NATIVE_SIZE="${STRICT_NATIVE_SIZE:-1}"; MAX_PIXELS="${MAX_PIXELS:-}"
 METADATA="${METADATA:-/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/dataset/focus_merged_6000_dedup_0710_v3/train/metadata_with_homography_warped_focus_ckptA.json}"
 DATASET_BASE="${DATASET_BASE:-/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/dataset/focus_merged_6000_dedup_0710_v3/train}"
 PRETRAINED_MODEL="${PRETRAINED_MODEL:-stabilityai/stable-diffusion-2-1-base}"; OUTPUT_ROOT="${OUTPUT_ROOT:-experiments/focus_fusion_tiny16}"
-OUTPUT_DIR="${OUTPUT_ROOT}/$(date +%Y%m%d_%H%M%S)"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"; OUTPUT_DIR="${OUTPUT_ROOT}/osediff_focus_${INPUT_MODE}_native_${TIMESTAMP}"
+NATIVE_ARGS=(); [[ "$NATIVE_RESOLUTION" == "1" ]] && NATIVE_ARGS+=(--native_resolution) || NATIVE_ARGS+=(--no-native_resolution)
+[[ "$STRICT_NATIVE_SIZE" == "1" ]] && NATIVE_ARGS+=(--strict_native_size) || NATIVE_ARGS+=(--no-strict_native_size)
+MAX_PIXEL_ARGS=(); [[ -n "$MAX_PIXELS" ]] && MAX_PIXEL_ARGS+=(--max_pixels "$MAX_PIXELS")
 CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
  --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
- --smoke --max_samples 16 --resolution 512 --condition_mode ab_focus --prompt_mode fixed --use_vsd 0 --train_batch_size 1 \
- --max_train_steps "$MAX_STEPS" --checkpointing_steps 250 --validation_steps 250 --mixed_precision "$MIXED_PRECISION"
-
+ --smoke --max_samples 16 --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "${USE_VSD:-0}" --train_batch_size "$TRAIN_BATCH_SIZE" \
+ --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" --max_train_steps "$MAX_STEPS" --checkpointing_steps 250 --validation_steps 250 \
+ --mixed_precision "$MIXED_PRECISION" "${NATIVE_ARGS[@]}" "${MAX_PIXEL_ARGS[@]}"

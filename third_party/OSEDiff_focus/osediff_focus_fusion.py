@@ -1,4 +1,4 @@
-"""One-step, dual-image OSEDiff model for multi-focus image fusion."""
+"""One-step OSEDiff generator for native-resolution focus fusion."""
 import copy
 from types import SimpleNamespace
 
@@ -8,10 +8,37 @@ import torch.nn.functional as F
 
 from dataloaders.focus_fusion_dataset import FIXED_FUSION_PROMPT
 
+INPUT_MODE_TO_CHANNELS = {
+    "single": 4,
+    "dual": 8,
+    "ab_focus": 10,
+    "quad_rgb": 16,
+}
+
+INPUT_MODE_ALIASES = {
+    "ab": "dual",
+    "four": "quad_rgb",
+}
+
+
+def normalize_input_mode(input_mode):
+    mode = INPUT_MODE_ALIASES.get(str(input_mode), str(input_mode))
+    if mode not in INPUT_MODE_TO_CHANNELS:
+        raise ValueError(f"unknown input_mode: {input_mode}")
+    return mode
+
+
+def get_generator_in_channels(input_mode):
+    return INPUT_MODE_TO_CHANNELS[normalize_input_mode(input_mode)]
+
 
 def expand_unet_conv_in(unet, new_in_channels):
     """Expand only ``conv_in``; preserve channel 0:4 and zero new channels."""
     old = unet.conv_in
+    if new_in_channels == old.in_channels == 4:
+        if hasattr(unet, "register_to_config"):
+            unet.register_to_config(in_channels=4)
+        return unet
     if new_in_channels < old.in_channels:
         raise ValueError(f"cannot shrink conv_in from {old.in_channels} to {new_in_channels}")
     new = nn.Conv2d(new_in_channels, old.out_channels, old.kernel_size, old.stride,
@@ -36,9 +63,7 @@ def expand_unet_conv_in(unet, new_in_channels):
 
 
 def condition_channels(mode):
-    if mode not in ("ab", "ab_focus"):
-        raise ValueError(f"unknown condition_mode: {mode}")
-    return 8 if mode == "ab" else 10
+    return get_generator_in_channels(mode)
 
 
 def move_scheduler_to_device(scheduler, device):
@@ -70,34 +95,75 @@ def laplacian_loss(pred, target):
 
 def tiled_unet_forward(unet, unet_input, timestep, prompt_embeds, output_channels=4,
                        tile_size=96, overlap=32):
-    """Tile full 8/10-channel input while accumulating exactly 4 output channels."""
+    """Tile full condition input with Gaussian blending and 4-channel output."""
+    if not (0 <= overlap < tile_size):
+        raise ValueError(f"tile overlap must satisfy 0 <= overlap < tile_size, got {overlap}, {tile_size}")
     _, _, h, w = unet_input.shape
     if h <= tile_size and w <= tile_size:
         return unet(unet_input, timestep, encoder_hidden_states=prompt_embeds).sample
     stride = max(1, tile_size - overlap)
-    ys = list(range(0, max(h - tile_size, 0) + 1, stride)); xs = list(range(0, max(w - tile_size, 0) + 1, stride))
-    if not ys or ys[-1] != h - tile_size: ys.append(max(0, h - tile_size))
-    if not xs or xs[-1] != w - tile_size: xs.append(max(0, w - tile_size))
+    ys = list(range(0, h, stride)); xs = list(range(0, w, stride))
     out = unet_input.new_zeros((unet_input.shape[0], output_channels, h, w))
     weights = unet_input.new_zeros((unet_input.shape[0], 1, h, w))
+
+    def gaussian(th, tw):
+        yy = torch.linspace(-1, 1, th, device=unet_input.device, dtype=unet_input.dtype)
+        xx = torch.linspace(-1, 1, tw, device=unet_input.device, dtype=unet_input.dtype)
+        gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+        weight = torch.exp(-(gx.square() + gy.square()) / 0.5).clamp_min(1e-3)
+        return weight.view(1, 1, th, tw)
+
     for y in ys:
         for x in xs:
-            tile = unet_input[..., y:y + tile_size, x:x + tile_size]
+            y2, x2 = min(y + tile_size, h), min(x + tile_size, w)
+            tile = unet_input[..., y:y2, x:x2]
             pred = unet(tile, timestep, encoder_hidden_states=prompt_embeds).sample
-            out[..., y:y + tile_size, x:x + tile_size] += pred
-            weights[..., y:y + tile_size, x:x + tile_size] += 1
+            weight = gaussian(y2 - y, x2 - x)
+            out[..., y:y2, x:x2] += pred * weight
+            weights[..., y:y2, x:x2] += weight
     return out / weights.clamp_min(1)
 
 
+def encode_rgb_conditions(images, vae, encode_mode="sample"):
+    if not images:
+        raise ValueError("at least one RGB condition image is required")
+    latent_dist = vae.encode(torch.cat(images, dim=0)).latent_dist
+    latents = latent_dist.sample() if encode_mode == "sample" else latent_dist.mode()
+    latents = latents * vae.config.scaling_factor
+    return list(latents.chunk(len(images), dim=0))
+
+
+def build_generator_unet_input(input_mode, latents, focus_a=None, focus_b=None):
+    mode = normalize_input_mode(input_mode)
+    needed = {"single": 1, "dual": 2, "ab_focus": 2, "quad_rgb": 4}[mode]
+    if len(latents) != needed:
+        raise ValueError(f"{mode} requires {needed} RGB latents, got {len(latents)}")
+    parts = list(latents)
+    if mode == "ab_focus":
+        if focus_a is None or focus_b is None:
+            raise ValueError("ab_focus requires both focus maps")
+        size = latents[0].shape[-2:]
+        parts += [F.interpolate(focus_a, size=size, mode="bilinear", align_corners=False),
+                  F.interpolate(focus_b, size=size, mode="bilinear", align_corners=False)]
+    value = torch.cat(parts, 1)
+    assert value.shape[1] == get_generator_in_channels(mode)
+    return value
+
+
+def vae_scale_factor(vae):
+    return 2 ** (len(vae.config.block_out_channels) - 1)
+
+
 class FocusFusionGenerator(nn.Module):
-    def __init__(self, unet, vae, scheduler, condition_mode="ab_focus", timestep=999):
+    def __init__(self, unet, vae, scheduler, input_mode="ab_focus", timestep=999):
         super().__init__()
         self.unet, self.vae, self.scheduler = unet, vae, scheduler
-        self.condition_mode = condition_mode
-        wanted = condition_channels(condition_mode)
+        self.input_mode = normalize_input_mode(input_mode)
+        self.condition_mode = self.input_mode
+        wanted = get_generator_in_channels(self.input_mode)
         if unet.conv_in.in_channels != wanted:
             expand_unet_conv_in(unet, wanted)
-        assert self.unet.config.in_channels in (8, 10)
+        assert self.unet.config.in_channels == wanted
         assert self.unet.config.out_channels == 4
         self.register_buffer("timesteps", torch.tensor([timestep], dtype=torch.long), persistent=False)
         self.register_buffer("fixed_prompt_embedding", torch.empty(0), persistent=True)
@@ -105,29 +171,23 @@ class FocusFusionGenerator(nn.Module):
     def cache_prompt(self, embedding):
         self.fixed_prompt_embedding = embedding.detach().clone()
 
-    def encode_images(self, a, b, mode="sample"):
-        posterior = self.vae.encode(torch.cat([a, b], 0)).latent_dist
-        z = posterior.sample() if mode == "sample" else posterior.mode()
-        z = z * self.vae.config.scaling_factor
-        return z.chunk(2, 0)
+    def encode_images(self, *images, mode="sample"):
+        return encode_rgb_conditions(list(images), self.vae, mode)
 
     def make_unet_input(self, z_a, z_b, focus_a=None, focus_b=None):
-        parts = [z_a, z_b]
-        if self.condition_mode == "ab_focus":
-            if focus_a is None or focus_b is None: raise ValueError("ab_focus requires both focus maps")
-            size = z_a.shape[-2:]
-            parts += [F.interpolate(focus_a, size=size, mode="bilinear", align_corners=False),
-                      F.interpolate(focus_b, size=size, mode="bilinear", align_corners=False)]
-        value = torch.cat(parts, 1)
-        assert value.shape[1] == condition_channels(self.condition_mode)
-        return value
+        return build_generator_unet_input(self.input_mode, [z_a, z_b], focus_a, focus_b)
 
-    def forward(self, a, b, focus_a, focus_b, prompt_embeds, vae_encode_mode="sample",
-                tiled=False, tile_size=96, tile_overlap=32, z_b_override=None):
-        z_a, z_b = self.encode_images(a, b, vae_encode_mode)
-        if z_b_override is not None:
-            z_b = z_b_override.to(device=z_a.device, dtype=z_a.dtype)
-        unet_input = self.make_unet_input(z_a, z_b, focus_a, focus_b)
+    def forward(self, conditions, focus_a=None, focus_b=None, prompt_embeds=None, vae_encode_mode="sample",
+                tiled=False, tile_size=96, tile_overlap=32, latent_overrides=None):
+        if isinstance(conditions, torch.Tensor):
+            conditions = [conditions]
+        a = conditions[0]
+        latents = self.encode_images(*conditions, mode=vae_encode_mode)
+        if latent_overrides:
+            for idx, value in latent_overrides.items():
+                latents[idx] = value.to(device=latents[0].device, dtype=latents[0].dtype)
+        z_a = latents[0]
+        unet_input = build_generator_unet_input(self.input_mode, latents, focus_a, focus_b)
         ts = self.timesteps.to(a.device)
         if hasattr(self.scheduler, "alphas_cumprod") and self.scheduler.alphas_cumprod.device != z_a.device:
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(z_a.device)
@@ -140,7 +200,10 @@ class FocusFusionGenerator(nn.Module):
         assert denoised.shape[1] == 4
         output = self.vae.decode(denoised / self.vae.config.scaling_factor).sample.clamp(-1, 1)
         if output.shape[-2:] != a.shape[-2:]:
-            output = F.interpolate(output, size=a.shape[-2:], mode="bilinear", align_corners=False).clamp(-1, 1)
+            raise RuntimeError(
+                f"decoded output size mismatch: A={tuple(a.shape[-2:])}, output={tuple(output.shape[-2:])}, "
+                f"latent={tuple(z_a.shape[-2:])}, vae_scale_factor={vae_scale_factor(self.vae)}, input_mode={self.input_mode}"
+            )
         assert output.shape[1] == 3
         return output, denoised, pred
 

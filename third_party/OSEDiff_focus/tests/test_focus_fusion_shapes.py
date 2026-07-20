@@ -1,36 +1,97 @@
 from types import SimpleNamespace
+
 import torch
-from osediff_focus_fusion import expand_unet_conv_in, tiled_unet_forward
+
+from osediff_focus_fusion import (
+    INPUT_MODE_TO_CHANNELS,
+    build_generator_unet_input,
+    encode_rgb_conditions,
+    expand_unet_conv_in,
+    tiled_unet_forward,
+)
+
 
 class DummyUNet(torch.nn.Module):
     def __init__(self):
-        super().__init__(); self.conv_in=torch.nn.Conv2d(4,8,3,padding=1); self.conv_out=torch.nn.Conv2d(8,4,1)
-        self.config=SimpleNamespace(in_channels=4,out_channels=4)
+        super().__init__()
+        self.conv_in = torch.nn.Conv2d(4, 8, 3, padding=1)
+        self.conv_out = torch.nn.Conv2d(8, 4, 1)
+        self.config = SimpleNamespace(in_channels=4, out_channels=4)
+
     def register_to_config(self, **kw):
-        for k,v in kw.items(): setattr(self.config,k,v)
-    def forward(self,x,timestep,encoder_hidden_states=None): return SimpleNamespace(sample=self.conv_out(torch.relu(self.conv_in(x))))
+        for k, v in kw.items():
+            setattr(self.config, k, v)
 
-def test_expand_preserves_base_and_zeros_extra():
-    u=DummyUNet(); weight=u.conv_in.weight.detach().clone(); bias=u.conv_in.bias.detach().clone()
-    expand_unet_conv_in(u,10)
-    assert u.conv_in.in_channels==u.config.in_channels==10
-    torch.testing.assert_close(u.conv_in.weight[:,:4],weight,rtol=0,atol=0)
-    assert torch.count_nonzero(u.conv_in.weight[:,4:])==0
-    torch.testing.assert_close(u.conv_in.bias,bias,rtol=0,atol=0)
-    assert u(torch.randn(2,10,8,8),torch.tensor([999])).sample.shape==(2,4,8,8)
+    def forward(self, x, timestep, encoder_hidden_states=None):
+        return SimpleNamespace(sample=self.conv_out(torch.relu(self.conv_in(x))))
 
-def test_tiled_10_to_4_shape():
-    u=expand_unet_conv_in(DummyUNet(),10); x=torch.randn(1,10,19,23)
-    y=tiled_unet_forward(u,x,torch.tensor([999]),torch.empty(1,1,1),4,8,3)
-    assert y.shape==(1,4,19,23)
 
-def test_scheduler_receives_four_channel_sample():
+class DummyVAE:
+    config = SimpleNamespace(scaling_factor=1.0, block_out_channels=[1, 2, 3, 4])
+
+    def encode(self, x):
+        class Dist:
+            def __init__(self, y):
+                self.y = y[:, :1].repeat(1, 4, 1, 1)
+
+            def sample(self):
+                return self.y
+
+            def mode(self):
+                return self.y
+
+        return SimpleNamespace(latent_dist=Dist(x))
+
+
+def test_input_mode_channels():
+    assert INPUT_MODE_TO_CHANNELS == {"single": 4, "dual": 8, "ab_focus": 10, "quad_rgb": 16}
+
+
+def test_conv_in_expand_rules():
+    base = DummyUNet()
+    old_layer = base.conv_in
+    same = expand_unet_conv_in(base, 4)
+    assert same.conv_in is old_layer
+    for channels in (8, 10, 16):
+        u = DummyUNet()
+        weight = u.conv_in.weight.detach().clone()
+        bias = u.conv_in.bias.detach().clone()
+        expand_unet_conv_in(u, channels)
+        assert u.conv_in.in_channels == u.config.in_channels == channels
+        torch.testing.assert_close(u.conv_in.weight[:, :4], weight, rtol=0, atol=0)
+        assert torch.count_nonzero(u.conv_in.weight[:, 4:]) == 0
+        torch.testing.assert_close(u.conv_in.bias, bias, rtol=0, atol=0)
+
+
+def test_build_inputs_all_modes_and_scheduler_sample_is_four():
+    z = [torch.randn(1, 4, 8, 12) + i for i in range(4)]
+    assert build_generator_unet_input("single", z[:1]).shape == (1, 4, 8, 12)
+    assert build_generator_unet_input("dual", z[:2]).shape == (1, 8, 8, 12)
+    fa, fb = torch.rand(1, 1, 64, 96), torch.rand(1, 1, 64, 96)
+    assert build_generator_unet_input("ab_focus", z[:2], fa, fb).shape == (1, 10, 8, 12)
+    assert build_generator_unet_input("quad_rgb", z).shape == (1, 16, 8, 12)
+    pred = torch.randn_like(z[0])
     class Scheduler:
-        def step(self,pred,t,sample,return_dict=True):
-            assert pred.shape[1]==sample.shape[1]==4
-            return SimpleNamespace(prev_sample=sample-pred)
-    u=expand_unet_conv_in(DummyUNet(),10); z_a=torch.randn(1,4,8,8); z_b=torch.randn(1,4,8,8)
-    inp=torch.cat([z_a,z_b,torch.rand(1,1,8,8),torch.rand(1,1,8,8)],1)
-    pred=u(inp,torch.tensor([999])).sample; out=Scheduler().step(pred,None,z_a).prev_sample
-    assert inp.shape[1]==10 and pred.shape[1]==out.shape[1]==4
+        def step(self, model_pred, timestep, sample, return_dict=True):
+            assert model_pred.shape[1] == sample.shape[1] == 4
+            return SimpleNamespace(prev_sample=sample - model_pred)
+    assert Scheduler().step(pred, None, z[0]).prev_sample.shape[1] == 4
 
+
+def test_multi_image_vae_order():
+    images = [torch.full((1, 3, 4, 4), float(i)) for i in range(1, 5)]
+    latents = encode_rgb_conditions(images, DummyVAE(), "mode")
+    assert [float(x[0, 0, 0, 0]) for x in latents] == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_tiled_gaussian_shape_all_channel_counts():
+    for channels in (4, 8, 10, 16):
+        u = expand_unet_conv_in(DummyUNet(), channels)
+        x = torch.randn(1, channels, 19, 23)
+        y = tiled_unet_forward(u, x, torch.tensor([999]), torch.empty(1, 1, 1), 4, 8, 3)
+        assert y.shape == (1, 4, 19, 23)
+
+
+def test_vsd_unet_stays_four_channel():
+    u = DummyUNet()
+    assert u.config.in_channels == 4

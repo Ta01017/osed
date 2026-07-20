@@ -1,36 +1,96 @@
 import json
+
 import numpy as np
-from PIL import Image
 import pytest
-from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT
+from PIL import Image
 
-def _files(tmp_path,n=3):
-    records=[]
-    for i in range(n):
-        names=[]
-        for j,mode in enumerate(("RGB","RGB","RGB","L","L")):
-            name=f"{i}_{j}.png"; value=(32+i*20+j) % 256
-            a=np.full((16,16,3) if mode=="RGB" else (16,16),value,np.uint8); Image.fromarray(a,mode).save(tmp_path/name); names.append(name)
-        records.append({"image":names[0],"edit_image":names[1:],"prompt":f"p{i}"})
-    meta=tmp_path/"metadata.json"; meta.write_text(json.dumps(records),encoding="utf-8"); return meta
+from dataloaders.focus_fusion_dataset import FocusFusionDataset, focus_fusion_collate
 
-def test_dataset_ranges_shapes_and_smoke(tmp_path):
-    meta=_files(tmp_path,20); ds=FocusFusionDataset(meta,tmp_path,resolution=8,smoke=True,prompt_mode="fixed")
-    assert len(ds)==16; x=ds[0]
-    assert x["gt"].shape==x["a"].shape==x["b_warp"].shape==(3,16,16)
-    assert x["focus_a"].shape==x["focus_b_warp"].shape==(1,16,16)
-    assert -1<=x["a"].min()<=x["a"].max()<=1 and 0<=x["focus_a"].min()<=x["focus_a"].max()<=1
-    assert x["prompt"]==FIXED_FUSION_PROMPT
 
-def test_resize_mode_is_explicit(tmp_path):
-    meta=_files(tmp_path); ds=FocusFusionDataset(meta,tmp_path,resolution=8,prompt_mode="fixed",native_resolution=False)
-    x=ds[0]
-    assert x["gt"].shape==(3,8,8) and x["focus_a"].shape==(1,8,8)
+def _img(root, name, size=(768, 512), mode="RGB", value=32):
+    shape = (size[1], size[0], 3) if mode == "RGB" else (size[1], size[0])
+    arr = np.full(shape, value % 256, np.uint8)
+    Image.fromarray(arr, mode).save(root / name)
+    return name
 
-def test_start_limit_metadata_prompt_and_absolute_paths(tmp_path):
-    meta=_files(tmp_path); ds=FocusFusionDataset(meta,tmp_path,8,max_samples=2,start_index=1,prompt_mode="metadata")
-    assert len(ds)==2 and ds[0]["metadata_index"]==1 and ds[0]["prompt"]=="p1"
 
-def test_missing_path_reports_index_and_full_path(tmp_path):
-    meta=tmp_path/"m.json"; meta.write_text(json.dumps([{"image":"missing.png","edit_image":["a","b","fa","fb"]}]))
-    with pytest.raises(FileNotFoundError,match=r"metadata index 0: missing path: .*missing.png"): FocusFusionDataset(meta,tmp_path,8)[0]
+def _meta(root, records):
+    p = root / "metadata.json"
+    p.write_text(json.dumps(records), encoding="utf-8")
+    return p
+
+
+def _record(root, ncond, explicit=False, focus=False, size=(768, 512)):
+    gt = _img(root, "gt.png", size, value=1)
+    cond = [_img(root, f"c{i}.png", size, value=10 + i) for i in range(ncond)]
+    rec = {"image": gt, "prompt": "p"}
+    if explicit:
+        rec["condition_images"] = cond
+    else:
+        rec["edit_image"] = list(cond)
+    if focus:
+        fmaps = [_img(root, f"f{i}.png", size, "L", 100 + i) for i in range(2)]
+        if explicit:
+            rec["focus_maps"] = fmaps
+        else:
+            rec["edit_image"] += fmaps
+    return rec
+
+
+@pytest.mark.parametrize("mode,ncond", [("single", 1), ("dual", 2), ("quad_rgb", 4)])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_rgb_modes_fields_and_native_size(tmp_path, mode, ncond, explicit):
+    meta = _meta(tmp_path, [_record(tmp_path, ncond, explicit=explicit, size=(768, 512))])
+    ds = FocusFusionDataset(meta, tmp_path, input_mode=mode, vae_scale_factor=8)
+    item = ds[0]
+    assert len(item["conditions"]) == ncond
+    assert item["gt"].shape[-2:] == (512, 768)
+    assert item["conditions"][0].shape[-2:] == (512, 768)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_ab_focus_fields_and_single_channel_focus(tmp_path, explicit):
+    meta = _meta(tmp_path, [_record(tmp_path, 2, explicit=explicit, focus=True, size=(960, 640))])
+    item = FocusFusionDataset(meta, tmp_path, input_mode="ab_focus", vae_scale_factor=8)[0]
+    assert len(item["conditions"]) == 2 and len(item["focus_maps"]) == 2
+    assert item["focus_maps"][0].shape == (1, 640, 960)
+
+
+def test_absolute_paths(tmp_path):
+    rec = _record(tmp_path, 1, explicit=True)
+    rec["image"] = str((tmp_path / rec["image"]).resolve())
+    rec["condition_images"] = [str((tmp_path / p).resolve()) for p in rec["condition_images"]]
+    item = FocusFusionDataset(_meta(tmp_path, [rec]), tmp_path, input_mode="single", vae_scale_factor=8)[0]
+    assert item["gt"].shape[-2:] == (512, 768)
+
+
+def test_size_mismatch_reports_all_sizes(tmp_path):
+    rec = _record(tmp_path, 2, explicit=True)
+    rec["condition_images"][1] = _img(tmp_path, "bad.png", (640, 512), value=9)
+    with pytest.raises(ValueError, match="size mismatch"):
+        FocusFusionDataset(_meta(tmp_path, [rec]), tmp_path, input_mode="dual", vae_scale_factor=8)[0]
+
+
+def test_vae_scale_factor_error_and_max_pixels(tmp_path):
+    rec = _record(tmp_path, 1, explicit=True, size=(770, 512))
+    with pytest.raises(ValueError, match="Native-resolution mode forbids"):
+        FocusFusionDataset(_meta(tmp_path, [rec]), tmp_path, input_mode="single", vae_scale_factor=8)[0]
+    rec2 = _record(tmp_path, 1, explicit=True, size=(768, 512))
+    with pytest.raises(ValueError, match="rejected rather than resized"):
+        FocusFusionDataset(_meta(tmp_path, [rec2]), tmp_path, input_mode="single", vae_scale_factor=8, max_pixels=10)[0]
+
+
+def test_mixed_batch_sizes_error(tmp_path):
+    rec1 = _record(tmp_path, 1, explicit=True, size=(768, 512))
+    rec2 = _record(tmp_path, 1, explicit=True, size=(960, 640))
+    ds = FocusFusionDataset(_meta(tmp_path, [rec1, rec2]), tmp_path, input_mode="single", vae_scale_factor=8)
+    with pytest.raises(ValueError, match="padding is forbidden"):
+        focus_fusion_collate([ds[0], ds[1]])
+
+
+def test_explicit_conflict_errors(tmp_path):
+    rec = _record(tmp_path, 2, explicit=False)
+    rec["condition_images"] = [rec["edit_image"][0], "different.png"]
+    _img(tmp_path, "different.png")
+    with pytest.raises(ValueError, match="conflicts"):
+        FocusFusionDataset(_meta(tmp_path, [rec]), tmp_path, input_mode="dual")[0]

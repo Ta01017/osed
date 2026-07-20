@@ -8,8 +8,8 @@ import time
 
 import torch
 
-from osediff_focus_fusion import FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint, move_scheduler_to_device
-from test_osediff_focus_fusion import parse_args as infer_parse_args
+from osediff_focus_fusion import (FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint,
+                                  move_scheduler_to_device, normalize_input_mode)
 
 
 def parse_args():
@@ -23,6 +23,7 @@ def parse_args():
     p.add_argument("--tiled", action="store_true")
     p.add_argument("--latent_tiled_size", type=int, default=96)
     p.add_argument("--latent_tiled_overlap", type=int, default=32)
+    p.add_argument("--vae_encode_mode", choices=["sample", "mode"], default="mode")
     p.add_argument("--pretrained_model_name_or_path")
     p.add_argument("--checkpoint_path")
     p.add_argument("--mixed_precision", choices=["fp16", "bf16", "fp32"], default="fp16")
@@ -62,6 +63,7 @@ def run_real(args, device):
     from models.unet_2d_condition import UNet2DConditionModel
 
     state = torch.load(args.checkpoint_path, map_location="cpu")
+    args.input_mode = normalize_input_mode(state.get("input_mode", args.input_mode))
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.mixed_precision]
     if device.type == "cpu":
         dtype = torch.float32
@@ -71,26 +73,34 @@ def run_real(args, device):
     scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     scheduler.set_timesteps(1, device=device)
     move_scheduler_to_device(scheduler, device)
-    model = FocusFusionGenerator(unet, vae, scheduler, state["condition_mode"])
+    model = FocusFusionGenerator(unet, vae, scheduler, args.input_mode)
     load_focus_checkpoint(model, state)
     model.to(device, dtype=dtype).eval()
-    a = torch.randn(1, 3, args.height, args.width, device=device, dtype=dtype).clamp(-1, 1)
-    b = torch.randn_like(a).clamp(-1, 1)
-    fa = torch.rand(1, 1, args.height, args.width, device=device, dtype=dtype)
-    fb = torch.rand_like(fa)
+    prep_start = time.perf_counter()
+    ncond = {"single": 1, "dual": 2, "ab_focus": 2, "quad_rgb": 4}[args.input_mode]
+    conditions = [torch.randn(1, 3, args.height, args.width, device=device, dtype=dtype).clamp(-1, 1) for _ in range(ncond)]
+    focus_maps = []
+    if args.input_mode == "ab_focus":
+        focus_maps = [torch.rand(1, 1, args.height, args.width, device=device, dtype=dtype) for _ in range(2)]
+    _sync(device)
+    preprocess_time = time.perf_counter() - prep_start
     prompt = model.fixed_prompt_embedding
     if not prompt.numel():
         prompt = torch.zeros(1, 77, 1024)
     prompt = prompt.to(device=device, dtype=dtype)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    phase = {"vae_encode": 0.0, "unet_one_step": 0.0, "scheduler_step": 0.0, "vae_decode": 0.0, "end_to_end": 0.0}
+    phase = {"image_load_preprocess": 0.0, "vae_encode": 0.0, "unet_one_step": 0.0, "scheduler_step": 0.0, "vae_decode": 0.0, "end_to_end": 0.0}
     for i in range(args.warmup_iterations + args.inference_iterations):
         _sync(device)
         t0 = time.perf_counter()
         with torch.no_grad():
-            s = time.perf_counter(); z_a, z_b = model.encode_images(a, b, "mode"); _sync(device); e = time.perf_counter()
-            unet_input = model.make_unet_input(z_a, z_b, fa, fb)
+            s = time.perf_counter(); latents = model.encode_images(*conditions, mode=args.vae_encode_mode); _sync(device); e = time.perf_counter()
+            z_a = latents[0]
+            fa = focus_maps[0] if focus_maps else None
+            fb = focus_maps[1] if len(focus_maps) > 1 else None
+            from osediff_focus_fusion import build_generator_unet_input
+            unet_input = build_generator_unet_input(args.input_mode, latents, fa, fb)
             ts = model.timesteps.to(device)
             s2 = time.perf_counter()
             if args.tiled:
@@ -108,6 +118,7 @@ def run_real(args, device):
             phase["scheduler_step"] += e3 - s3
             phase["vae_decode"] += e4 - s4
             phase["end_to_end"] += t1 - t0
+            phase["image_load_preprocess"] += preprocess_time
     for key, value in phase.items():
         print(f"{key}: {value / args.inference_iterations:.6f}s")
     print(f"peak_memory_mb: {_peak(device):.2f}")

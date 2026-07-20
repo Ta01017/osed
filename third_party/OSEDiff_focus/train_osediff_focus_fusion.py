@@ -8,9 +8,10 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT
+from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT, focus_fusion_collate
 from osediff_focus_fusion import (FocusFusionGenerator, checkpoint_payload, gradient_loss,
-                                  laplacian_loss, masked_l1, move_scheduler_to_device)
+                                  laplacian_loss, masked_l1, move_scheduler_to_device,
+                                  get_generator_in_channels, normalize_input_mode, vae_scale_factor)
 
 
 def parse_args(argv=None):
@@ -19,7 +20,8 @@ def parse_args(argv=None):
     p.add_argument("--metadata_path", required=True)
     p.add_argument("--dataset_base_path", required=True)
     p.add_argument("--output_dir", required=True)
-    p.add_argument("--condition_mode", choices=["ab", "ab_focus"], default="ab_focus")
+    p.add_argument("--input_mode", choices=["single", "dual", "quad_rgb", "ab_focus", "ab", "four"], default="ab_focus")
+    p.add_argument("--condition_mode", choices=["ab", "ab_focus", "dual", "single", "quad_rgb", "four"], default=None)
     p.add_argument("--prompt_mode", choices=["fixed", "metadata", "ram"], default="fixed")
     p.add_argument("--cache_fixed_prompt_embedding", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--resolution", type=int, default=512)
@@ -40,6 +42,7 @@ def parse_args(argv=None):
     p.add_argument("--keep_soft_width", type=float, default=.1)
     p.add_argument("--native_resolution", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--strict_native_size", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--max_pixels", type=int, help="Maximum allowed native pixels. Images are rejected rather than resized.")
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--lr_scheduler", type=str, default="constant")
     p.add_argument("--lr_warmup_steps", type=int, default=500)
@@ -155,25 +158,31 @@ def run_validation(model, loader, encode_fn, args, accelerator, step):
             emb = raw_model.fixed_prompt_embedding.to(accelerator.device).expand(len(prompts), -1, -1)
         else:
             emb = encode_fn(prompts, accelerator.device)
-        a = batch["a"].to(accelerator.device)
-        b = batch["b_warp"].to(accelerator.device)
+        conditions = [x.to(accelerator.device) for x in batch["conditions"]]
         gt = batch["gt"].to(accelerator.device)
-        fa = batch["focus_a"].to(accelerator.device)
-        fb = batch["focus_b_warp"].to(accelerator.device)
-        pred, _, _ = raw_model(a, b, fa, fb, emb, "mode")
-        keep = _soft_keep(fa, args.keep_threshold, args.keep_soft_width)
-        final = keep * a + (1 - keep) * pred if args.keep_a_composite else pred
+        focus_maps = [x.to(accelerator.device) for x in batch["focus_maps"]]
+        fa = focus_maps[0] if focus_maps else None
+        fb = focus_maps[1] if len(focus_maps) > 1 else None
+        pred, _, _ = raw_model(conditions, fa, fb, emb, "mode")
+        final = pred
+        if args.keep_a_composite:
+            if args.input_mode != "ab_focus":
+                raise RuntimeError("--keep_a_composite is only valid for ab_focus")
+            keep = _soft_keep(fa, args.keep_threshold, args.keep_soft_width)
+            final = keep * conditions[0] + (1 - keep) * pred
         idx = int(batch["metadata_index"].item())
         folder = out_root / f"{idx:06d}"
         folder.mkdir(parents=True, exist_ok=True)
-        images = {"A.png": _pil(a), "B_warp.png": _pil(b), "GT.png": _pil(gt),
-                  "focus_A.png": _pil(fa, True), "focus_B_warp.png": _pil(fb, True),
-                  "pred_raw.png": _pil(pred), "final.png": _pil(final)}
+        images = {"GT.png": _pil(gt), "pred_raw.png": _pil(pred), "final.png": _pil(final)}
+        for i, cond in enumerate(conditions):
+            images[f"{chr(ord('A') + i)}.png"] = _pil(cond)
+        for i, fmap in enumerate(focus_maps):
+            images[f"focus_{i}.png"] = _pil(fmap, True)
         if args.keep_a_composite:
             images["pred_keepa_composite.png"] = _pil(final)
         for name, image in images.items():
             image.save(folder / name)
-        panel_names = ["A.png", "B_warp.png", "GT.png", "focus_A.png", "focus_B_warp.png", "pred_raw.png"]
+        panel_names = [f"{chr(ord('A') + i)}.png" for i in range(len(conditions))] + ["GT.png"] + [f"focus_{i}.png" for i in range(len(focus_maps))] + ["pred_raw.png"]
         if args.keep_a_composite:
             panel_names.append("pred_keepa_composite.png")
         panels = [images[n].convert("RGB") for n in panel_names]
@@ -199,6 +208,9 @@ def main(args):
 
     if args.lora_rank is None:
         args.lora_rank = args.lora_rank_unet
+    args.input_mode = normalize_input_mode(args.condition_mode or args.input_mode)
+    if args.input_mode != "ab_focus" and (args.lambda_keep or args.lambda_bref):
+        print(f"WARNING: keep-A and B-reference losses are disabled for input_mode={args.input_mode}; no fake masks will be created")
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, mixed_precision=args.mixed_precision)
     set_seed(args.seed); Path(args.output_dir, "checkpoints").mkdir(parents=True, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
@@ -207,7 +219,7 @@ def main(args):
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     # Required order: base UNet -> expand conv_in -> add adapters.
-    expand_unet_conv_in(unet, 8 if args.condition_mode == "ab" else 10)
+    expand_unet_conv_in(unet, get_generator_in_channels(args.input_mode))
     unet.requires_grad_(False); vae.requires_grad_(False); text_encoder.requires_grad_(False)
     lora_targets = _add_generator_lora(unet, args.lora_rank_unet)
     vae_lora_targets = _add_vae_lora(vae, args.lora_rank_unet) if args.train_vae_lora else []
@@ -216,7 +228,7 @@ def main(args):
     scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     scheduler.set_timesteps(1, device=accelerator.device)
     move_scheduler_to_device(scheduler, accelerator.device)
-    model = FocusFusionGenerator(unet, vae, scheduler, args.condition_mode)
+    model = FocusFusionGenerator(unet, vae, scheduler, args.input_mode)
     assert model.unet.config.out_channels == 4
     model.focus_lora_targets = lora_targets
     model.lora_rank_unet = args.lora_rank_unet
@@ -245,14 +257,15 @@ def main(args):
         ram_model = ram(pretrained=args.ram_path, pretrained_condition=args.ram_ft_path, image_size=384, vit="swin_l")
         ram_model.eval().to(accelerator.device, dtype=torch.float16)
 
+    sf = vae_scale_factor(vae)
     dataset = FocusFusionDataset(args.metadata_path, args.dataset_base_path, args.resolution,
         args.random_crop, args.center_crop, args.random_flip, args.max_samples, args.start_index, args.smoke, args.prompt_mode,
-        args.native_resolution, args.strict_native_size)
+        args.native_resolution, args.strict_native_size, args.input_mode, sf, args.max_pixels)
     val_dataset = FocusFusionDataset(args.metadata_path, args.dataset_base_path, args.resolution,
         False, False, False, args.validation_max_samples, 0, False, args.prompt_mode,
-        args.native_resolution, args.strict_native_size)
-    loader = DataLoader(dataset, args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
+        args.native_resolution, args.strict_native_size, args.input_mode, sf, args.max_pixels)
+    loader = DataLoader(dataset, args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers, collate_fn=focus_fusion_collate)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=focus_fusion_collate)
     param_groups = _groups(model, args, model_reg)
     optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate)
     lr_scheduler = get_scheduler(args.lr_scheduler, optimizer=optimizer,
@@ -288,14 +301,21 @@ def main(args):
             if args.prompt_mode == "fixed" and raw.fixed_prompt_embedding.numel():
                 emb = raw.fixed_prompt_embedding.to(accelerator.device).expand(len(prompts), -1, -1)
             else: emb = encode(prompts, accelerator.device)
-            pred, latent, _ = model(batch["a"], batch["b_warp"], batch["focus_a"], batch["focus_b_warp"], emb, "sample")
-            gt, a, fa, fb = batch["gt"], batch["a"], batch["focus_a"], batch["focus_b_warp"]
-            keep, bref = fa.clamp(0, 1), ((1 - fa) * fb).clamp(0, 1)
+            conditions = [x.to(accelerator.device) for x in batch["conditions"]]
+            focus_maps = [x.to(accelerator.device) for x in batch["focus_maps"]]
+            fa = focus_maps[0] if focus_maps else None
+            fb = focus_maps[1] if len(focus_maps) > 1 else None
+            pred, latent, _ = model(conditions, fa, fb, emb, "sample")
+            gt, a = batch["gt"].to(accelerator.device), conditions[0]
             losses = {"l2": F.mse_loss(pred.float(), gt.float()) * args.lambda_l2,
-                      "keep": masked_l1(pred.float(), a.float(), keep.float()) * args.lambda_keep,
-                      "bref": masked_l1(pred.float(), gt.float(), bref.float()) * args.lambda_bref,
                       "gradient": gradient_loss(pred.float(), gt.float()) * args.lambda_gradient,
                       "laplacian": laplacian_loss(pred.float(), gt.float()) * args.lambda_laplacian}
+            if args.input_mode == "ab_focus":
+                keep, bref = fa.clamp(0, 1), ((1 - fa) * fb).clamp(0, 1)
+                losses["keep"] = masked_l1(pred.float(), a.float(), keep.float()) * args.lambda_keep
+                losses["bref"] = masked_l1(pred.float(), gt.float(), bref.float()) * args.lambda_bref
+            else:
+                losses_disabled = ["keep", "bref"]
             if args.lambda_lpips:
                 import lpips
                 if not hasattr(main, "lpips_net"): main.lpips_net = lpips.LPIPS(net="vgg").to(accelerator.device).requires_grad_(False)
