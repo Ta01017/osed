@@ -56,6 +56,46 @@ def test_ab_focus_fields_and_single_channel_focus(tmp_path, explicit):
     assert item["focus_maps"][0].shape == (1, 640, 960)
 
 
+def test_ab_focus_legacy_edit_image_splits_conditions_and_focus(tmp_path):
+    rec = _record(tmp_path, 2, explicit=False, focus=True, size=(768, 512))
+    item = FocusFusionDataset(_meta(tmp_path, [rec]), tmp_path, input_mode="ab_focus", vae_scale_factor=8)[0]
+    assert item["paths"]["conditions"] == [str((tmp_path / "c0.png").resolve()), str((tmp_path / "c1.png").resolve())]
+    assert item["paths"]["focus_maps"] == [str((tmp_path / "f0.png").resolve()), str((tmp_path / "f1.png").resolve())]
+    assert len(item["conditions"]) == 2 and len(item["focus_maps"]) == 2
+    assert item["focus_maps"][0].shape[0] == 1
+
+
+def test_ab_focus_explicit_and_legacy_same_allowed(tmp_path):
+    rec = _record(tmp_path, 2, explicit=False, focus=True)
+    rec["condition_images"] = rec["edit_image"][:2]
+    rec["focus_maps"] = rec["edit_image"][2:4]
+    item = FocusFusionDataset(_meta(tmp_path, [rec]), tmp_path, input_mode="ab_focus", vae_scale_factor=8)[0]
+    assert len(item["conditions"]) == 2 and len(item["focus_maps"]) == 2
+
+
+@pytest.mark.parametrize("edit_images", [
+    ["a.png", "b.png", "fa.png"],
+    ["a.png", "b.png", "fa.png", "fb.png", "extra.png"],
+])
+def test_ab_focus_legacy_wrong_count_errors(tmp_path, edit_images):
+    for name in edit_images + ["gt.png"]:
+        _img(tmp_path, name)
+    rec = {"image": "gt.png", "edit_image": edit_images}
+    with pytest.raises(ValueError, match="metadata index 0, input_mode ab_focus"):
+        FocusFusionDataset(_meta(tmp_path, [rec]), tmp_path, input_mode="ab_focus")[0]
+
+
+@pytest.mark.parametrize("rec", [
+    {"image": "gt.png", "condition_images": ["a.png"], "focus_maps": ["fa.png", "fb.png"]},
+    {"image": "gt.png", "condition_images": ["a.png", "b.png"], "focus_maps": ["fa.png"]},
+])
+def test_ab_focus_explicit_wrong_count_errors(tmp_path, rec):
+    for name in {"gt.png", "a.png", "b.png", "fa.png", "fb.png"}:
+        _img(tmp_path, name, mode="L" if name.startswith("f") else "RGB")
+    with pytest.raises(ValueError, match="metadata index 0, input_mode ab_focus"):
+        FocusFusionDataset(_meta(tmp_path, [rec]), tmp_path, input_mode="ab_focus")[0]
+
+
 def test_absolute_paths(tmp_path):
     rec = _record(tmp_path, 1, explicit=True)
     rec["image"] = str((tmp_path / rec["image"]).resolve())

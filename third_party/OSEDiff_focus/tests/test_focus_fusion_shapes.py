@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from osediff_focus_fusion import (
     INPUT_MODE_TO_CHANNELS,
@@ -90,6 +91,33 @@ def test_tiled_gaussian_shape_all_channel_counts():
         x = torch.randn(1, channels, 19, 23)
         y = tiled_unet_forward(u, x, torch.tensor([999]), torch.empty(1, 1, 1), 4, 8, 3)
         assert y.shape == (1, 4, 19, 23)
+
+
+class ConstantUNet(torch.nn.Module):
+    config = SimpleNamespace(out_channels=4)
+
+    def __init__(self):
+        super().__init__()
+        self.tile_shapes = []
+
+    def forward(self, x, timestep, encoder_hidden_states=None):
+        self.tile_shapes.append(tuple(x.shape[-2:]))
+        return SimpleNamespace(sample=torch.ones(x.shape[0], 4, x.shape[-2], x.shape[-1], device=x.device, dtype=x.dtype))
+
+
+@pytest.mark.parametrize("overlap", [0, 8])
+def test_tiled_constant_prediction_preserved(overlap):
+    u = ConstantUNet()
+    x = torch.randn(1, 10, 65, 91)
+    y = tiled_unet_forward(u, x, torch.tensor([999]), torch.empty(1, 1, 1), 4, 32, overlap)
+    torch.testing.assert_close(y, torch.ones_like(y), atol=1e-5, rtol=1e-5)
+    assert (1, 27) in u.tile_shapes or (17, 32) in u.tile_shapes
+
+
+@pytest.mark.parametrize("bad_overlap", [-1, 32, 33])
+def test_tiled_invalid_overlap_errors(bad_overlap):
+    with pytest.raises(ValueError):
+        tiled_unet_forward(ConstantUNet(), torch.randn(1, 4, 65, 91), torch.tensor([999]), torch.empty(1, 1, 1), 4, 32, bad_overlap)
 
 
 def test_vsd_unet_stays_four_channel():

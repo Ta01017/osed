@@ -39,6 +39,49 @@ def _metadata_records(path):
     return obj
 
 
+def parse_metadata_inputs(item, input_mode, metadata_index):
+    mode = normalize_input_mode(input_mode)
+
+    def parse_explicit():
+        conditions = item.get("condition_images")
+        focus = item.get("focus_maps", [])
+        if conditions is None:
+            return None
+        if not isinstance(conditions, list) or len(conditions) != INPUT_MODE_COUNTS[mode]:
+            raise ValueError(f"metadata index {metadata_index}, input_mode {mode}: condition_images has wrong length")
+        if mode == "ab_focus":
+            if not isinstance(focus, list) or len(focus) != 2:
+                raise ValueError(f"metadata index {metadata_index}, input_mode {mode}: focus_maps has wrong length")
+        elif focus:
+            raise ValueError(f"metadata index {metadata_index}, input_mode {mode}: focus_maps is only valid for ab_focus")
+        return list(conditions), list(focus)
+
+    def parse_edit():
+        edits = item.get("edit_image")
+        if edits is None:
+            return None
+        if not isinstance(edits, list):
+            raise ValueError(f"metadata index {metadata_index}, input_mode {mode}: edit_image must be a list")
+        expected = 4 if mode in ("quad_rgb", "ab_focus") else INPUT_MODE_COUNTS[mode]
+        if len(edits) != expected:
+            raise ValueError(f"metadata index {metadata_index}, input_mode {mode}: edit_image has wrong length {len(edits)}, expected {expected}")
+        if mode == "ab_focus":
+            return list(edits[:2]), list(edits[2:4])
+        return list(edits[:INPUT_MODE_COUNTS[mode]]), []
+
+    explicit = parse_explicit()
+    legacy = parse_edit()
+    if explicit and legacy and explicit != legacy:
+        raise ValueError(
+            f"metadata index {metadata_index}, input_mode {mode}: condition_images/focus_maps conflict with edit_image; "
+            f"condition_images={item.get('condition_images')}, focus_maps={item.get('focus_maps')}, edit_image={item.get('edit_image')}"
+        )
+    result = explicit or legacy
+    if result is None:
+        raise ValueError(f"metadata index {metadata_index}, input_mode {mode}: missing condition_images or edit_image")
+    return result
+
+
 class FocusFusionDataset(Dataset):
     """Load GT, RGB conditions, and optional focus maps without resizing."""
 
@@ -83,26 +126,7 @@ class FocusFusionDataset(Dataset):
         return full
 
     def _conditions_and_focus(self, rec, index):
-        explicit = rec.get("condition_images")
-        edits = rec.get("edit_image")
-        if explicit is not None and edits is not None:
-            edit_conditions = edits[:INPUT_MODE_COUNTS[self.input_mode]]
-            if list(explicit) != list(edit_conditions):
-                raise ValueError(f"metadata index {index}, input_mode {self.input_mode}: condition_images conflicts with edit_image")
-        cond = explicit if explicit is not None else edits
-        if not isinstance(cond, list) or len(cond) != INPUT_MODE_COUNTS[self.input_mode]:
-            raise ValueError(f"metadata index {index}, input_mode {self.input_mode}: expected {INPUT_MODE_COUNTS[self.input_mode]} condition images")
-        focus = []
-        if self.input_mode == "ab_focus":
-            if rec.get("focus_maps") is not None:
-                focus = rec["focus_maps"]
-                if edits is not None and len(edits) >= 4 and list(focus) != list(edits[2:4]):
-                    raise ValueError(f"metadata index {index}, input_mode ab_focus: focus_maps conflicts with edit_image")
-            elif isinstance(edits, list) and len(edits) == 4:
-                focus = edits[2:4]
-            if not isinstance(focus, list) or len(focus) != 2:
-                raise ValueError(f"metadata index {index}, input_mode ab_focus: expected 2 focus maps")
-        return cond, focus
+        return parse_metadata_inputs(rec, self.input_mode, index)
 
     def _check_size(self, index, named_images, a_path):
         sizes = {name: image.size for name, image, _ in named_images}
@@ -124,9 +148,9 @@ class FocusFusionDataset(Dataset):
     def __getitem__(self, item):
         rec, index = self.records[item], self.source_indices[item]
         cond_values, focus_values = self._conditions_and_focus(rec, index)
-        gt_path = self._path(rec["image"], index, "image")
-        cond_paths = [self._path(x, index, f"condition_images[{i}]") for i, x in enumerate(cond_values)]
-        focus_paths = [self._path(x, index, f"focus_maps[{i}]") for i, x in enumerate(focus_values)]
+        gt_path = self._path(rec["image"], index, "GT[0]")
+        cond_paths = [self._path(x, index, f"condition[{i}]") for i, x in enumerate(cond_values)]
+        focus_paths = [self._path(x, index, f"focus[{i}]") for i, x in enumerate(focus_values)]
         gt = Image.open(gt_path).convert("RGB")
         cond_images = [Image.open(p).convert("RGB") for p in cond_paths]
         focus_images = [Image.open(p).convert("L") for p in focus_paths]

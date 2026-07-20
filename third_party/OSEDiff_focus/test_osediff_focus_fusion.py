@@ -12,7 +12,8 @@ from torch.utils.data import DataLoader
 
 from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT, focus_fusion_collate
 from osediff_focus_fusion import (FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint,
-                                  move_scheduler_to_device, normalize_input_mode)
+                                  move_scheduler_to_device, normalize_input_mode, read_focus_checkpoint_config,
+                                  load_vae_lora_state)
 
 
 def parse_args(argv=None):
@@ -57,8 +58,9 @@ def main(args):
     from transformers import AutoTokenizer, CLIPTextModel
     from models.autoencoder_kl import AutoencoderKL
     from models.unet_2d_condition import UNet2DConditionModel
-    state = torch.load(args.checkpoint_path, map_location="cpu")
-    ckpt_mode = normalize_input_mode(state.get("input_mode", state.get("condition_mode", "ab_focus")))
+    ckpt = read_focus_checkpoint_config(args.checkpoint_path)
+    state = ckpt["state"]
+    ckpt_mode = ckpt["input_mode"]
     args.input_mode = normalize_input_mode(args.input_mode or ckpt_mode)
     if args.input_mode != ckpt_mode:
         raise RuntimeError(f"input_mode mismatch: checkpoint={ckpt_mode}, requested={args.input_mode}")
@@ -80,27 +82,26 @@ def main(args):
     expand_unet_conv_in(unet, state["generator_in_channels"])
     # Adapters must exist before loading LoRA. Recreate exact target names stored by PEFT keys.
     lora_state = state.get("generator_unet_lora", {})
-    rank = int(state.get("rank_unet") or state.get("args", {}).get("lora_rank_unet", 4))
+    rank = ckpt["generator_lora_rank"]
     if lora_state:
         from peft import LoraConfig
-        targets = state.get("generator_unet_lora_targets") or sorted({k.split(".lora_", 1)[0] for k in lora_state if ".lora_" in k})
-        unet.add_adapter(LoraConfig(r=rank, target_modules=targets), adapter_name="focus_fusion")
-        unet.set_adapter(["focus_fusion"])
+        targets = ckpt["generator_lora_targets"] or sorted({k.split(".lora_", 1)[0] for k in lora_state if ".lora_" in k})
+        unet.add_adapter(LoraConfig(r=rank, target_modules=targets), adapter_name=ckpt["generator_lora_adapter_name"])
+        unet.set_adapter([ckpt["generator_lora_adapter_name"]])
     vae_lora_state = state.get("vae_lora", {})
     if vae_lora_state:
         from peft import LoraConfig
-        targets = state.get("vae_lora_targets")
+        targets = ckpt["vae_lora_targets"]
         if not targets:
             raise RuntimeError("checkpoint contains VAE LoRA weights but no vae_lora_targets metadata")
-        vae.add_adapter(LoraConfig(r=int(state.get("rank_vae") or rank), target_modules=targets), adapter_name="focus_vae_encoder")
-        vae.set_adapter(["focus_vae_encoder"])
+        vae.add_adapter(LoraConfig(r=ckpt["vae_lora_rank"], target_modules=targets), adapter_name=ckpt["vae_lora_adapter_name"])
+        vae.set_adapter([ckpt["vae_lora_adapter_name"]])
     scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler"); scheduler.set_timesteps(1, device=device)
     move_scheduler_to_device(scheduler, device)
     model = FocusFusionGenerator(unet, vae, scheduler, args.input_mode)
     load_focus_checkpoint(model, state)
     if vae_lora_state:
-        result = model.vae.load_state_dict(vae_lora_state, strict=False)
-        print("VAE missing keys:", result.missing_keys, "unexpected keys:", result.unexpected_keys)
+        load_vae_lora_state(model, state)
     model.to(device, dtype=dtype).eval()
     if text is not None:
         text.to(device, dtype=dtype).eval()

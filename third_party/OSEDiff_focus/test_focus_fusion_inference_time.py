@@ -9,7 +9,8 @@ import time
 import torch
 
 from osediff_focus_fusion import (FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint,
-                                  move_scheduler_to_device, normalize_input_mode)
+                                  move_scheduler_to_device, normalize_input_mode, read_focus_checkpoint_config,
+                                  load_vae_lora_state)
 
 
 def parse_args():
@@ -19,7 +20,7 @@ def parse_args():
     p.add_argument("--inference_iterations", type=int, default=50)
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
-    p.add_argument("--input_mode", choices=["ab", "ab_focus"], default="ab_focus")
+    p.add_argument("--input_mode", choices=["single", "dual", "ab_focus", "quad_rgb", "ab", "four"])
     p.add_argument("--tiled", action="store_true")
     p.add_argument("--latent_tiled_size", type=int, default=96)
     p.add_argument("--latent_tiled_overlap", type=int, default=32)
@@ -62,20 +63,40 @@ def run_real(args, device):
     from models.autoencoder_kl import AutoencoderKL
     from models.unet_2d_condition import UNet2DConditionModel
 
-    state = torch.load(args.checkpoint_path, map_location="cpu")
-    args.input_mode = normalize_input_mode(state.get("input_mode", args.input_mode))
+    ckpt = read_focus_checkpoint_config(args.checkpoint_path)
+    state = ckpt["state"]
+    ckpt_mode = ckpt["input_mode"]
+    if args.input_mode is not None and normalize_input_mode(args.input_mode) != ckpt_mode:
+        raise RuntimeError(f"input_mode mismatch: checkpoint={ckpt_mode}, requested={args.input_mode}")
+    args.input_mode = ckpt_mode
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.mixed_precision]
     if device.type == "cpu":
         dtype = torch.float32
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     expand_unet_conv_in(unet, state["generator_in_channels"])
+    if state.get("generator_unet_lora"):
+        from peft import LoraConfig
+        unet.add_adapter(LoraConfig(r=ckpt["generator_lora_rank"], target_modules=ckpt["generator_lora_targets"]),
+                         adapter_name=ckpt["generator_lora_adapter_name"])
+        unet.set_adapter([ckpt["generator_lora_adapter_name"]])
+    if state.get("vae_lora"):
+        from peft import LoraConfig
+        vae.add_adapter(LoraConfig(r=ckpt["vae_lora_rank"], target_modules=ckpt["vae_lora_targets"]),
+                        adapter_name=ckpt["vae_lora_adapter_name"])
+        vae.set_adapter([ckpt["vae_lora_adapter_name"]])
     scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     scheduler.set_timesteps(1, device=device)
     move_scheduler_to_device(scheduler, device)
     model = FocusFusionGenerator(unet, vae, scheduler, args.input_mode)
     load_focus_checkpoint(model, state)
+    load_vae_lora_state(model, state)
     model.to(device, dtype=dtype).eval()
+    print(f"checkpoint: {args.checkpoint_path}")
+    print(f"input_mode: {args.input_mode}, generator_in_channels: {state['generator_in_channels']}, generator_lora_rank: {ckpt['generator_lora_rank']}")
+    print(f"train_vae_lora: {ckpt['train_vae_lora']}, use_vsd: {ckpt['use_vsd']}")
+    print(f"native_hw: {args.height}x{args.width}, tiled: {args.tiled}, tile_size: {args.latent_tiled_size}, tile_overlap: {args.latent_tiled_overlap}")
+    print(f"vae_encode_mode: {args.vae_encode_mode}, warmup: {args.warmup_iterations}, repeat: {args.inference_iterations}")
     prep_start = time.perf_counter()
     ncond = {"single": 1, "dual": 2, "ab_focus": 2, "quad_rgb": 4}[args.input_mode]
     conditions = [torch.randn(1, 3, args.height, args.width, device=device, dtype=dtype).clamp(-1, 1) for _ in range(ncond)]

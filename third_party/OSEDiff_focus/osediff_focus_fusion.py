@@ -96,19 +96,20 @@ def laplacian_loss(pred, target):
 def tiled_unet_forward(unet, unet_input, timestep, prompt_embeds, output_channels=4,
                        tile_size=96, overlap=32):
     """Tile full condition input with Gaussian blending and 4-channel output."""
-    if not (0 <= overlap < tile_size):
+    if tile_size <= 0 or not (0 <= overlap < tile_size):
         raise ValueError(f"tile overlap must satisfy 0 <= overlap < tile_size, got {overlap}, {tile_size}")
     _, _, h, w = unet_input.shape
     if h <= tile_size and w <= tile_size:
         return unet(unet_input, timestep, encoder_hidden_states=prompt_embeds).sample
     stride = max(1, tile_size - overlap)
     ys = list(range(0, h, stride)); xs = list(range(0, w, stride))
-    out = unet_input.new_zeros((unet_input.shape[0], output_channels, h, w))
-    weights = unet_input.new_zeros((unet_input.shape[0], 1, h, w))
+    original_dtype = unet_input.dtype
+    out = torch.zeros((unet_input.shape[0], output_channels, h, w), dtype=torch.float32, device=unet_input.device)
+    weights = torch.zeros((unet_input.shape[0], 1, h, w), dtype=torch.float32, device=unet_input.device)
 
     def gaussian(th, tw):
-        yy = torch.linspace(-1, 1, th, device=unet_input.device, dtype=unet_input.dtype)
-        xx = torch.linspace(-1, 1, tw, device=unet_input.device, dtype=unet_input.dtype)
+        yy = torch.linspace(-1, 1, th, device=unet_input.device, dtype=torch.float32)
+        xx = torch.linspace(-1, 1, tw, device=unet_input.device, dtype=torch.float32)
         gy, gx = torch.meshgrid(yy, xx, indexing="ij")
         weight = torch.exp(-(gx.square() + gy.square()) / 0.5).clamp_min(1e-3)
         return weight.view(1, 1, th, tw)
@@ -119,9 +120,9 @@ def tiled_unet_forward(unet, unet_input, timestep, prompt_embeds, output_channel
             tile = unet_input[..., y:y2, x:x2]
             pred = unet(tile, timestep, encoder_hidden_states=prompt_embeds).sample
             weight = gaussian(y2 - y, x2 - x)
-            out[..., y:y2, x:x2] += pred * weight
+            out[..., y:y2, x:x2] += pred.float() * weight
             weights[..., y:y2, x:x2] += weight
-    return out / weights.clamp_min(1)
+    return (out / weights.clamp_min(1e-6)).to(original_dtype)
 
 
 def encode_rgb_conditions(images, vae, encode_mode="sample"):
@@ -152,6 +153,68 @@ def build_generator_unet_input(input_mode, latents, focus_a=None, focus_b=None):
 
 def vae_scale_factor(vae):
     return 2 ** (len(vae.config.block_out_channels) - 1)
+
+
+def _load_lora_state(module, state, label):
+    module_state = module.state_dict()
+    missing = [k for k in state if k not in module_state]
+    unexpected = [k for k in module_state if "lora" in k and k not in state]
+    print(f"{label} LoRA missing keys:", missing, "unexpected keys:", unexpected)
+    if missing or unexpected:
+        raise RuntimeError(f"{label} LoRA checkpoint load failed")
+    with torch.no_grad():
+        for key, value in state.items():
+            module_state[key].copy_(value.to(device=module_state[key].device, dtype=module_state[key].dtype))
+
+
+def load_generator_lora_state(model, state):
+    load_state = state.get("generator_unet_lora", {})
+    if load_state:
+        _load_lora_state(model.unet, load_state, "Generator UNet")
+
+
+def load_vae_lora_state(model, state):
+    load_state = state.get("vae_lora", {})
+    if state.get("train_vae_lora") and not load_state:
+        raise RuntimeError("checkpoint train_vae_lora=true but VAE LoRA state is missing")
+    if load_state:
+        _load_lora_state(model.vae, load_state, "VAE")
+
+
+def load_vsd_lora_state(vsd, state):
+    load_state = state.get("vsd_unet_lora", {})
+    if state.get("use_vsd") and not load_state:
+        raise RuntimeError("checkpoint use_vsd=true but VSD LoRA state is missing")
+    if load_state:
+        if vsd is None:
+            raise RuntimeError("checkpoint contains VSD LoRA but VSD module was not created")
+        _load_lora_state(vsd.unet_update, load_state, "VSD update UNet")
+
+
+def read_focus_checkpoint_config(checkpoint_path):
+    state = torch.load(checkpoint_path, map_location="cpu") if isinstance(checkpoint_path, (str, bytes)) else checkpoint_path
+    args = state.get("args", {})
+    input_mode = normalize_input_mode(state.get("input_mode", state.get("condition_mode", args.get("input_mode", "ab_focus"))))
+    return {
+        "state": state,
+        "input_mode": input_mode,
+        "generator_in_channels": int(state["generator_in_channels"]),
+        "generator_lora_rank": int(state.get("rank_unet") or args.get("lora_rank_unet", 4)),
+        "generator_lora_adapter_name": state.get("generator_lora_adapter_name", "focus_fusion"),
+        "generator_lora_targets": state.get("generator_unet_lora_targets", []),
+        "train_conv_in": bool(state.get("train_conv_in", args.get("train_conv_in", True))),
+        "train_vae_lora": bool(state.get("train_vae_lora", args.get("train_vae_lora", bool(state.get("vae_lora"))))),
+        "vae_lora_rank": int(state.get("rank_vae") or args.get("lora_rank_unet", 4)),
+        "vae_lora_adapter_name": state.get("vae_lora_adapter_name", "focus_vae_encoder"),
+        "vae_lora_targets": state.get("vae_lora_targets", []),
+        "use_vsd": bool(state.get("use_vsd", args.get("use_vsd", bool(state.get("vsd_unet_lora"))))),
+        "vsd_lora_rank": int(state.get("rank_vsd", args.get("lora_rank", args.get("lora_rank_unet", 4)))),
+        "vsd_lora_adapter_name": state.get("vsd_lora_adapter_name", "default_others"),
+        "vsd_lora_targets": state.get("vsd_lora_targets", []),
+        "prompt_mode": state.get("prompt_mode", args.get("prompt_mode", "fixed")),
+        "fixed_prompt": state.get("fixed_prompt", FIXED_FUSION_PROMPT),
+        "global_step": int(state.get("global_step", state.get("training_step", 0))),
+    }
 
 
 class FocusFusionGenerator(nn.Module):
@@ -211,17 +274,25 @@ class FocusFusionGenerator(nn.Module):
 def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd=None, accelerator=None):
     unet_state = {k: v.detach().cpu() for k, v in model.unet.state_dict().items() if "lora" in k}
     input_mode = getattr(args, "input_mode", getattr(args, "condition_mode", model.condition_mode))
-    return {"format_version": 2, "input_mode": input_mode, "condition_mode": model.condition_mode,
+    return {"format_version": 2, "input_mode": normalize_input_mode(input_mode), "condition_mode": model.condition_mode,
             "generator_in_channels": model.unet.conv_in.in_channels,
             "generator_conv_in": copy.deepcopy(model.unet.conv_in.state_dict()),
             "generator_unet_lora": unet_state,
+            "generator_lora_adapter_name": getattr(model, "generator_lora_adapter_name", "focus_fusion"),
             "generator_unet_lora_targets": getattr(model, "focus_lora_targets", []),
             "rank_unet": getattr(model, "lora_rank_unet", getattr(args, "lora_rank_unet", None)),
             "vae_lora_targets": getattr(model, "focus_vae_lora_targets", []),
+            "vae_lora_adapter_name": getattr(model, "vae_lora_adapter_name", "focus_vae_encoder"),
             "rank_vae": getattr(model, "lora_rank_vae", getattr(args, "lora_rank_unet", None)),
             "vae_lora": {k: v.detach().cpu() for k, v in model.vae.state_dict().items() if "lora" in k},
             "vsd_unet_lora": {k: v.detach().cpu() for k, v in vsd.unet_update.state_dict().items() if "lora" in k} if vsd is not None else {},
             "vsd_lora_targets": getattr(vsd, "lora_unet_modules_encoder", []) + getattr(vsd, "lora_unet_modules_decoder", []) + getattr(vsd, "lora_unet_others", []) if vsd is not None else [],
+            "vsd_lora_adapter_name": getattr(vsd, "vsd_lora_adapter_name", "default_others") if vsd is not None else None,
+            "rank_vsd": getattr(args, "lora_rank", getattr(args, "lora_rank_unet", None)),
+            "train_conv_in": bool(getattr(args, "train_conv_in", True)),
+            "train_vae_lora": bool(getattr(args, "train_vae_lora", False)),
+            "use_vsd": bool(getattr(args, "use_vsd", False)),
+            "prompt_mode": getattr(args, "prompt_mode", "fixed"),
             "fixed_prompt": FIXED_FUSION_PROMPT,
             "cache_fixed_prompt_embedding": bool(getattr(args, "cache_fixed_prompt_embedding", True)),
             "fixed_prompt_embedding": model.fixed_prompt_embedding.cpu(),
@@ -244,14 +315,7 @@ def load_focus_checkpoint(model, checkpoint, load_lora=True):
     if "weight" not in state["generator_conv_in"] or ("bias" in model.unet.conv_in.state_dict() and "bias" not in state["generator_conv_in"]):
         raise RuntimeError("checkpoint did not provide required conv_in weight/bias")
     if load_lora:
-        lora_state = state.get("generator_unet_lora", {})
-        result = model.unet.load_state_dict(lora_state, strict=False)
-        print("UNet missing keys:", result.missing_keys, "unexpected keys:", result.unexpected_keys)
-        bad_unexpected = [k for k in result.unexpected_keys if "lora" in k]
-        loaded = set(lora_state)
-        missing_lora = [k for k in loaded if k not in model.unet.state_dict()]
-        if bad_unexpected or missing_lora:
-            raise RuntimeError(f"LoRA checkpoint load failed: unexpected={bad_unexpected} missing_lora={missing_lora}")
+        load_generator_lora_state(model, state)
     if state.get("fixed_prompt_embedding") is not None:
         model.cache_prompt(state["fixed_prompt_embedding"])
     return state
