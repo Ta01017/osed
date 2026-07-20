@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT, focus_fusion_collate
 from osediff_focus_fusion import (FocusFusionGenerator, checkpoint_payload, gradient_loss,
                                   laplacian_loss, masked_l1, move_scheduler_to_device,
-                                  get_generator_in_channels, normalize_input_mode, vae_scale_factor)
+                                  get_generator_in_channels, normalize_input_mode, vae_scale_factor,
+                                  load_vae_lora_state, load_vsd_lora_state)
 
 
 def parse_args(argv=None):
@@ -108,8 +109,14 @@ def _groups(model, args, vsd=None):
     if args.train_vae_lora:
         groups.append({"name": "vae_lora", "params": [p for n, p in model.vae.named_parameters() if "lora" in n and p.requires_grad]})
     if vsd is not None:
-        groups.append({"name": "vsd_lora", "params": [p for n, p in vsd.unet_update.named_parameters() if "lora" in n and p.requires_grad]})
+        groups.append({"name": "vsd_update_lora", "params": [p for n, p in vsd.unet_update.named_parameters() if "lora" in n and p.requires_grad]})
     groups = [g for g in groups if g["params"]]
+    seen = set()
+    for g in groups:
+        for p in g["params"]:
+            if id(p) in seen:
+                raise RuntimeError("same Parameter appears in multiple optimizer groups")
+            seen.add(id(p))
     ids = {id(p) for g in groups for p in g["params"]}
     if args.train_conv_in:
         assert id(model.unet.conv_in.weight) in ids, "expanded conv_in weight is absent from optimizer"
@@ -119,7 +126,7 @@ def _groups(model, args, vsd=None):
     total = 0
     for g in groups:
         count = sum(p.numel() for p in g["params"]); train = sum(p.numel() for p in g["params"] if p.requires_grad); total += train
-        print(f"optimizer group {g['name']}: parameters={count:,}, requires_grad={train:,}")
+        print(f"optimizer group {g['name']}: tensors={len(g['params'])}, parameters={count:,}, requires_grad={train:,}")
     print(f"total trainable parameters: {total:,}")
     return groups
 
@@ -138,6 +145,27 @@ def _soft_keep(mask, threshold, width):
     if width <= 0:
         return (mask >= threshold).to(mask.dtype)
     return ((mask - (threshold - width / 2)) / width).clamp(0, 1)
+
+
+def simulate_optimizer_update_schedule(num_micro_batches, gradient_accumulation_steps, max_train_steps,
+                                       start_global_step=0, checkpointing_steps=0, validation_steps=0):
+    global_step = int(start_global_step)
+    optimizer_steps = scheduler_steps = consumed = 0
+    checkpoints, validations = [], []
+    for _ in range(num_micro_batches):
+        if global_step >= max_train_steps:
+            break
+        consumed += 1
+        if consumed % gradient_accumulation_steps == 0:
+            optimizer_steps += 1
+            scheduler_steps += 1
+            global_step += 1
+            if checkpointing_steps and global_step % checkpointing_steps == 0:
+                checkpoints.append(global_step)
+            if validation_steps and global_step % validation_steps == 0:
+                validations.append(global_step)
+    return {"global_step": global_step, "micro_batches": consumed, "optimizer_steps": optimizer_steps,
+            "scheduler_steps": scheduler_steps, "checkpoints": checkpoints, "validations": validations}
 
 
 @torch.no_grad()
@@ -276,6 +304,9 @@ def main(args):
     pending_lr_state = None
     if args.resume_from_checkpoint:
         state = load_focus_checkpoint(model, args.resume_from_checkpoint)
+        load_vae_lora_state(model, state)
+        if model_reg is not None:
+            load_vsd_lora_state(model_reg, state)
         if state.get("optimizer"):
             if len(state["optimizer"].get("param_groups", [])) != len(optimizer.param_groups):
                 raise RuntimeError("optimizer parameter group count mismatch during resume")
@@ -288,58 +319,71 @@ def main(args):
         model, text_encoder, optimizer, loader, val_loader, lr_scheduler = accelerator.prepare(model, text_encoder, optimizer, loader, val_loader, lr_scheduler)
     else:
         model, model_reg, text_encoder, optimizer, loader, val_loader, lr_scheduler = accelerator.prepare(model, model_reg, text_encoder, optimizer, loader, val_loader, lr_scheduler)
-    iterator = iter(loader)
-    for step in range(start + 1, args.max_train_steps + 1):
-        try: batch = next(iterator)
-        except StopIteration: iterator = iter(loader); batch = next(iterator)
-        with accelerator.accumulate(model):
-            prompts = batch["prompt"]
-            if args.prompt_mode == "ram":
-                x = ram_tf(batch["gt"].mul(0.5).add(0.5)).to(accelerator.device, dtype=torch.float16)
-                prompts = [str(x) for x in ram_infer(x, ram_model)]
-            raw = accelerator.unwrap_model(model)
-            if args.prompt_mode == "fixed" and raw.fixed_prompt_embedding.numel():
-                emb = raw.fixed_prompt_embedding.to(accelerator.device).expand(len(prompts), -1, -1)
-            else: emb = encode(prompts, accelerator.device)
-            conditions = [x.to(accelerator.device) for x in batch["conditions"]]
-            focus_maps = [x.to(accelerator.device) for x in batch["focus_maps"]]
-            fa = focus_maps[0] if focus_maps else None
-            fb = focus_maps[1] if len(focus_maps) > 1 else None
-            pred, latent, _ = model(conditions, fa, fb, emb, "sample")
-            gt, a = batch["gt"].to(accelerator.device), conditions[0]
-            losses = {"l2": F.mse_loss(pred.float(), gt.float()) * args.lambda_l2,
-                      "gradient": gradient_loss(pred.float(), gt.float()) * args.lambda_gradient,
-                      "laplacian": laplacian_loss(pred.float(), gt.float()) * args.lambda_laplacian}
-            if args.input_mode == "ab_focus":
-                keep, bref = fa.clamp(0, 1), ((1 - fa) * fb).clamp(0, 1)
-                losses["keep"] = masked_l1(pred.float(), a.float(), keep.float()) * args.lambda_keep
-                losses["bref"] = masked_l1(pred.float(), gt.float(), bref.float()) * args.lambda_bref
-            else:
-                losses_disabled = ["keep", "bref"]
-            if args.lambda_lpips:
-                import lpips
-                if not hasattr(main, "lpips_net"): main.lpips_net = lpips.LPIPS(net="vgg").to(accelerator.device).requires_grad_(False)
-                losses["lpips"] = main.lpips_net(pred.float(), gt.float()).mean() * args.lambda_lpips
-            neg_emb = None
-            if model_reg is not None and args.lambda_vsd:
-                neg_emb = encode([""] * len(prompts), accelerator.device)
-                reg = model_reg.module if hasattr(model_reg, "module") else model_reg
-                losses["vsd"] = reg.distribution_matching_loss(latent, emb, neg_emb, args) * args.lambda_vsd
-            if model_reg is not None and args.lambda_vsd_lora:
-                reg = model_reg.module if hasattr(model_reg, "module") else model_reg
-                losses["vsd_lora"] = reg.diff_loss(latent, emb, args) * args.lambda_vsd_lora
-            loss = sum(losses.values())
-            accelerator.backward(loss)
+    global_step = int(start)
+    optimizer.zero_grad(set_to_none=True)
+    while global_step < args.max_train_steps:
+        for batch in loader:
+            with accelerator.accumulate(model):
+                prompts = batch["prompt"]
+                if args.prompt_mode == "ram":
+                    x = ram_tf(batch["gt"].mul(0.5).add(0.5)).to(accelerator.device, dtype=torch.float16)
+                    prompts = [str(x) for x in ram_infer(x, ram_model)]
+                raw = accelerator.unwrap_model(model)
+                if args.prompt_mode == "fixed" and raw.fixed_prompt_embedding.numel():
+                    emb = raw.fixed_prompt_embedding.to(accelerator.device).expand(len(prompts), -1, -1)
+                else:
+                    emb = encode(prompts, accelerator.device)
+                conditions = [x.to(accelerator.device) for x in batch["conditions"]]
+                focus_maps = [x.to(accelerator.device) for x in batch["focus_maps"]]
+                fa = focus_maps[0] if focus_maps else None
+                fb = focus_maps[1] if len(focus_maps) > 1 else None
+                pred, latent, _ = model(conditions, fa, fb, emb, "sample")
+                gt, a = batch["gt"].to(accelerator.device), conditions[0]
+                losses = {"l2": F.mse_loss(pred.float(), gt.float()) * args.lambda_l2,
+                          "gradient": gradient_loss(pred.float(), gt.float()) * args.lambda_gradient,
+                          "laplacian": laplacian_loss(pred.float(), gt.float()) * args.lambda_laplacian}
+                if args.input_mode == "ab_focus":
+                    keep, bref = fa.clamp(0, 1), ((1 - fa) * fb).clamp(0, 1)
+                    losses["keep"] = masked_l1(pred.float(), a.float(), keep.float()) * args.lambda_keep
+                    losses["bref"] = masked_l1(pred.float(), gt.float(), bref.float()) * args.lambda_bref
+                if args.lambda_lpips:
+                    import lpips
+                    if not hasattr(main, "lpips_net"):
+                        main.lpips_net = lpips.LPIPS(net="vgg").to(accelerator.device).requires_grad_(False)
+                    losses["lpips"] = main.lpips_net(pred.float(), gt.float()).mean() * args.lambda_lpips
+                if model_reg is not None and args.lambda_vsd:
+                    neg_emb = encode([""] * len(prompts), accelerator.device)
+                    reg = model_reg.module if hasattr(model_reg, "module") else model_reg
+                    losses["vsd"] = reg.distribution_matching_loss(latent, emb, neg_emb, args) * args.lambda_vsd
+                if model_reg is not None and args.lambda_vsd_lora:
+                    reg = model_reg.module if hasattr(model_reg, "module") else model_reg
+                    losses["vsd_lora"] = reg.diff_loss(latent, emb, args) * args.lambda_vsd_lora
+                loss = sum(losses.values())
+                if not torch.isfinite(loss):
+                    print("non-finite loss components:", {k: float(v.detach().float().cpu()) for k, v in losses.items()})
+                    print("metadata_index:", batch["metadata_index"])
+                    raise RuntimeError("NaN/Inf loss detected")
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], args.max_grad_norm)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], args.max_grad_norm)
-            optimizer.step(); lr_scheduler.step(); optimizer.zero_grad(set_to_none=True)
-        if accelerator.is_main_process and (step == 1 or step % 10 == 0): print(step, {k: round(v.item(), 6) for k, v in losses.items()})
-        if args.validation_steps > 0 and step % args.validation_steps == 0:
-            run_validation(model, val_loader, encode, args, accelerator, step)
-        if accelerator.is_main_process and step % args.checkpointing_steps == 0:
-            raw = accelerator.unwrap_model(model)
-            raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
-            torch.save(checkpoint_payload(raw, step, args, optimizer, lr_scheduler, raw_reg, accelerator), Path(args.output_dir, "checkpoints", f"focus_fusion_{step}.pt"))
+                if accelerator.is_main_process and (global_step == 1 or global_step % 10 == 0):
+                    log_losses = {k: round(v.item(), 6) for k, v in losses.items()}
+                    if args.input_mode != "ab_focus":
+                        log_losses["keep"] = "disabled"; log_losses["bref"] = "disabled"
+                    print(global_step, log_losses)
+                if args.validation_steps > 0 and global_step % args.validation_steps == 0:
+                    run_validation(model, val_loader, encode, args, accelerator, global_step)
+                if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
+                    raw = accelerator.unwrap_model(model)
+                    raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
+                    torch.save(checkpoint_payload(raw, global_step, args, optimizer, lr_scheduler, raw_reg, accelerator), Path(args.output_dir, "checkpoints", f"focus_fusion_{global_step}.pt"))
+                if global_step >= args.max_train_steps:
+                    break
 
 
 if __name__ == "__main__": main(parse_args())

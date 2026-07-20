@@ -10,7 +10,9 @@ KEEP_ARGS=(); if [[ "${KEEP_A_COMPOSITE:-0}" == "1" ]]; then KEEP_ARGS+=(--keep_
 NATIVE_ARGS=(); [[ "$NATIVE_RESOLUTION" == "1" ]] && NATIVE_ARGS+=(--native_resolution) || NATIVE_ARGS+=(--no-native_resolution)
 [[ "$STRICT_NATIVE_SIZE" == "1" ]] && NATIVE_ARGS+=(--strict_native_size) || NATIVE_ARGS+=(--no-strict_native_size)
 MAX_PIXEL_ARGS=(); [[ -n "$MAX_PIXELS" ]] && MAX_PIXEL_ARGS+=(--max_pixels "$MAX_PIXELS")
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"; OUTPUT_DIR="${OUTPUT_ROOT}/osediff_focus_${INPUT_MODE}_native_infer_${TIMESTAMP}"
+[[ -e "$OUTPUT_DIR" ]] && { echo "output exists: $OUTPUT_DIR" >&2; exit 1; }
 CUDA_VISIBLE_DEVICES="$GPU" python test_osediff_focus_fusion.py --pretrained_model_name_or_path "$PRETRAINED_MODEL" --checkpoint_path "$CHECKPOINT" \
- --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "${OUTPUT_ROOT}/$(date +%Y%m%d_%H%M%S)" \
+ --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
  --input_mode "$INPUT_MODE" --vae_encode_mode "$VAE_ENCODE_MODE" --start_index "${START_INDEX:-0}" --max_samples "${MAX_SAMPLES:-16}" \
  --seed "${SEED:-123}" --run_all_ablations "${KEEP_ARGS[@]}" "${NATIVE_ARGS[@]}" "${MAX_PIXEL_ARGS[@]}"

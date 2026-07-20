@@ -10,7 +10,7 @@ import torch
 
 from osediff_focus_fusion import (FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint,
                                   move_scheduler_to_device, normalize_input_mode, read_focus_checkpoint_config,
-                                  load_vae_lora_state)
+                                  load_vae_lora_state, get_generator_in_channels)
 
 
 def parse_args():
@@ -43,7 +43,8 @@ def _peak(device):
 
 
 def run_mock(args, device):
-    channels = 10 if args.input_mode == "ab_focus" else 8
+    args.input_mode = normalize_input_mode(args.input_mode or "ab_focus")
+    channels = get_generator_in_channels(args.input_mode)
     conv = torch.nn.Conv2d(channels, 4, 3, padding=1).to(device)
     x = torch.randn(1, channels, args.height // 8, args.width // 8, device=device)
     for _ in range(args.warmup_iterations):
@@ -53,7 +54,7 @@ def run_mock(args, device):
     for _ in range(args.inference_iterations):
         conv(x)
     _sync(device)
-    print(f"MOCK Conv2d-only time, not OSEDiff inference: {(time.perf_counter() - start) / args.inference_iterations:.6f}s")
+    print(f"mock_conv_only input_mode={args.input_mode} channels={channels}: {(time.perf_counter() - start) / args.inference_iterations:.6f}s")
 
 
 def run_real(args, device):
