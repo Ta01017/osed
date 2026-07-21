@@ -290,6 +290,11 @@ def load_verified_checkpoint(checkpoint_path):
         else:
             with open(path, "r", encoding="utf-8") as handle:
                 verified[key] = json.load(handle)
+    if int(manifest["global_step"]) != int(verified["trainer_state"].get("global_step", -1)):
+        raise RuntimeError(
+            f"checkpoint global_step mismatch: manifest={manifest['global_step']} "
+            f"trainer_state={verified['trainer_state'].get('global_step')}"
+        )
     print(f"checkpoint verified: {checkpoint_dir}")
     return verified
 
@@ -506,20 +511,12 @@ def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd
             "fixed_prompt": FIXED_FUSION_PROMPT,
             "cache_fixed_prompt_embedding": bool(getattr(args, "cache_fixed_prompt_embedding", True)),
             "fixed_prompt_embedding": model.fixed_prompt_embedding.cpu(),
-            "training_step": int(step), "global_step": int(step),
-            "completed_epochs": int(completed_epochs),
-            "micro_steps_in_current_epoch": int(micro_steps_in_current_epoch),
-            "dataloader_position": int(dataloader_position),
-            "sampler_epoch": sampler_epoch,
             "gradient_accumulation_steps": int(getattr(args, "gradient_accumulation_steps", 1)),
             "world_size": int(getattr(accelerator, "num_processes", 1)) if accelerator is not None else 1,
             "train_batch_size": int(getattr(args, "train_batch_size", 1)),
             "optimizer_group_manifest": optimizer_group_manifest or [],
-            "rng_state": capture_rng_state(),
-            "scaler_state": getattr(getattr(accelerator, "scaler", None), "state_dict", lambda: None)() if accelerator is not None else None,
             "args": vars(args).copy(),
-            "optimizer": optimizer.state_dict() if optimizer else None,
-            "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler else None}
+            }
 
 
 def load_focus_checkpoint(model, checkpoint, load_lora=True):

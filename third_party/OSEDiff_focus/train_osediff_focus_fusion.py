@@ -44,6 +44,7 @@ def parse_args(argv=None):
     p.add_argument("--max_train_steps", type=int, default=10000)
     p.add_argument("--checkpointing_steps", type=int, default=500)
     p.add_argument("--validation_steps", type=int, default=500)
+    p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--validation_max_samples", type=int, default=4)
     p.add_argument("--keep_a_composite", action="store_true")
     p.add_argument("--keep_threshold", type=float, default=.5)
@@ -52,6 +53,7 @@ def parse_args(argv=None):
     p.add_argument("--strict_native_size", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max_pixels", type=int, help="Maximum allowed native pixels. Images are rejected rather than resized.")
     p.add_argument("--learning_rate", type=float, default=5e-5)
+    p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--lr_scheduler", type=str, default="constant")
     p.add_argument("--lr_warmup_steps", type=int, default=500)
     p.add_argument("--lr_num_cycles", type=int, default=1)
@@ -59,7 +61,7 @@ def parse_args(argv=None):
     p.add_argument("--lora_rank_unet", type=int, default=8)
     p.add_argument("--lora_rank_vae", type=int, default=4)
     p.add_argument("--lora_rank_vsd", type=int, default=8)
-    p.add_argument("--lora_rank", type=int, default=None, help="legacy compatibility only; prefer --lora_rank_unet/vae/vsd")
+    p.add_argument("--lora_rank", type=int, default=None, help="Deprecated. Use --lora_rank_unet/vae/vsd.")
     p.add_argument("--train_conv_in", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--train_vae_lora", action="store_true")
     p.add_argument("--use_vsd", type=int, choices=[0, 1], default=0)
@@ -128,10 +130,15 @@ def optimizer_group_manifest(param_groups):
                 raise RuntimeError(f"frozen parameter in optimizer group {group['name']}")
         manifest.append({
             "name": group["name"],
+            "group_name": group["name"],
             "parameter_names": list(names),
             "parameter_shapes": {k: list(v) for k, v in shapes.items()},
             "num_tensors": len(group["params"]),
             "num_parameters": int(sum(p.numel() for p in group["params"])),
+            "tensor_count": len(group["params"]),
+            "total_numel": int(sum(p.numel() for p in group["params"])),
+            "lr": group.get("lr"),
+            "weight_decay": group.get("weight_decay"),
         })
     return manifest
 
@@ -142,11 +149,16 @@ def validate_optimizer_manifest(saved, current):
     if len(saved) != len(current):
         raise RuntimeError(f"optimizer group count mismatch: checkpoint={len(saved)} current={len(current)}")
     for old, new in zip(saved, current):
-        for key in ("name", "num_tensors", "num_parameters"):
+        for key in ("name", "num_tensors", "num_parameters", "lr", "weight_decay"):
             if old.get(key) != new.get(key):
                 raise RuntimeError(f"optimizer group manifest mismatch for {new.get('name')}: {key} checkpoint={old.get(key)} current={new.get(key)}")
-        if set(old.get("parameter_names", [])) != set(new.get("parameter_names", [])):
-            raise RuntimeError(f"optimizer group parameter names mismatch for {new['name']}")
+        if old.get("parameter_names", []) != new.get("parameter_names", []):
+            raise RuntimeError(
+                "[OPTIMIZER MANIFEST MISMATCH]\n"
+                f"group={new['name']}\n"
+                f"checkpoint_names={old.get('parameter_names', [])}\n"
+                f"current_names={new.get('parameter_names', [])}"
+            )
         if old.get("parameter_shapes", {}) != new.get("parameter_shapes", {}):
             raise RuntimeError(f"optimizer group parameter shapes mismatch for {new['name']}")
 
@@ -182,7 +194,7 @@ def validate_resume_config(args, resume_cfg):
     for name, cli_value in structural.items():
         ckpt_value = resume_cfg[name]
         if cli_value != ckpt_value:
-            raise RuntimeError(f"resume structural parameter conflict: {name}: checkpoint={ckpt_value} CLI={cli_value}")
+                _resume_mismatch(name, ckpt_value, cli_value)
     args.input_mode = resume_cfg["input_mode"]
     args.lora_rank_unet = resume_cfg["generator_lora_rank"]
     args.lora_rank_vae = resume_cfg["vae_lora_rank"]
@@ -194,21 +206,23 @@ def validate_resume_config(args, resume_cfg):
     return args
 
 
-def resume_training_from_checkpoint(*, resume_state, optimizer=None, lr_scheduler=None, accelerator=None, optimizer_manifest=None):
+def resume_training_from_checkpoint(*, trainer_state, optimizer=None, lr_scheduler=None, accelerator=None, optimizer_manifest=None):
     """Restore only trainer progress; optimizer/scheduler/scaler/RNG are restored by Accelerate."""
-    if not resume_state:
+    if not trainer_state:
         return {"global_step": 0, "completed_epochs": 0, "micro_steps_in_current_epoch": 0}
-    if optimizer_manifest is not None:
-        validate_optimizer_manifest(resume_state.get("optimizer_group_manifest"), optimizer_manifest)
+    if optimizer_manifest is not None and trainer_state.get("optimizer_group_manifest") is not None:
+        validate_optimizer_manifest(trainer_state["optimizer_group_manifest"], optimizer_manifest)
     print("[RESUME] optimizer restored by Accelerate")
     print("[RESUME] scheduler restored by Accelerate")
     print("[RESUME] scaler restored by Accelerate")
     print("[RESUME] rank RNG restored by Accelerate")
     progress = {
-        "global_step": int(resume_state.get("global_step", resume_state.get("training_step", 0))),
-        "completed_epochs": int(resume_state.get("completed_epochs", 0)),
-        "micro_steps_in_current_epoch": int(resume_state.get("micro_steps_in_current_epoch", resume_state.get("dataloader_position", 0))),
+        "global_step": int(trainer_state["global_step"]),
+        "completed_epochs": int(trainer_state.get("completed_epochs", trainer_state.get("current_epoch", 0))),
+        "micro_steps_in_current_epoch": int(trainer_state["batches_consumed_in_current_epoch"]),
     }
+    progress["current_epoch"] = progress["completed_epochs"]
+    progress["batches_consumed_in_current_epoch"] = progress["micro_steps_in_current_epoch"]
     print(f"[RESUME] checkpoint global_step {progress['global_step']}")
     print(f"[RESUME] completed_epochs {progress['completed_epochs']}")
     print(f"[RESUME] micro_steps_in_current_epoch {progress['micro_steps_in_current_epoch']}")
@@ -238,10 +252,110 @@ def _resume_mismatch(field, checkpoint_value, current_value):
     )
 
 
+def normalize_path_for_resume(path):
+    return None if path is None else str(Path(path).expanduser().resolve())
+
+
+RESUME_CONFIG_FIELDS = {
+    "pretrained_model_name_or_path", "input_mode", "generator_in_channels", "lora_rank_unet",
+    "lora_rank_vae", "lora_rank_vsd", "train_conv_in", "train_vae_lora", "use_vsd",
+    "prompt_mode", "fixed_prompt", "cache_fixed_prompt_embedding", "generator_adapter_name",
+    "vae_adapter_name", "vsd_adapter_name", "generator_target_modules", "vae_target_modules",
+    "vsd_target_modules", "vae_scale_factor", "metadata_path", "dataset_base_path",
+    "start_index", "max_samples", "dataset_length", "train_batch_size",
+    "gradient_accumulation_steps", "world_size", "seed", "sampler_seed", "drop_last",
+    "random_flip", "mixed_precision", "learning_rate", "weight_decay", "lr_scheduler",
+    "lr_warmup_steps", "max_pixels", "native_resolution", "strict_native_size", "lambda_l2",
+    "lambda_lpips", "lambda_vsd", "lambda_vsd_lora", "lambda_keep", "lambda_bref",
+    "lambda_gradient", "lambda_laplacian",
+}
+RESUME_OVERRIDE_FIELDS = {"max_train_steps", "checkpointing_steps", "validation_steps", "validation_max_samples", "logging_steps", "output_dir"}
+
+
+def build_resume_config_snapshot(args, *, model, accelerator, dataset_length):
+    return {
+        "pretrained_model_name_or_path": normalize_path_for_resume(args.pretrained_model_name_or_path),
+        "input_mode": normalize_input_mode(args.input_mode),
+        "generator_in_channels": int(model.unet.conv_in.in_channels),
+        "lora_rank_unet": int(args.lora_rank_unet),
+        "lora_rank_vae": int(args.lora_rank_vae),
+        "lora_rank_vsd": int(args.lora_rank_vsd),
+        "train_conv_in": bool(args.train_conv_in),
+        "train_vae_lora": bool(args.train_vae_lora),
+        "use_vsd": bool(args.use_vsd),
+        "prompt_mode": args.prompt_mode,
+        "fixed_prompt": FIXED_FUSION_PROMPT,
+        "cache_fixed_prompt_embedding": bool(args.cache_fixed_prompt_embedding),
+        "generator_adapter_name": getattr(model, "generator_lora_adapter_name", "focus_fusion"),
+        "vae_adapter_name": getattr(model, "vae_lora_adapter_name", "focus_vae_encoder"),
+        "vsd_adapter_name": getattr(model, "vsd_lora_adapter_name", None),
+        "generator_target_modules": list(getattr(model, "focus_lora_targets", [])),
+        "vae_target_modules": list(getattr(model, "focus_vae_lora_targets", [])),
+        "vsd_target_modules": list(getattr(model, "focus_vsd_lora_targets", [])),
+        "vae_scale_factor": int(vae_scale_factor(model.vae)),
+        "metadata_path": normalize_path_for_resume(args.metadata_path),
+        "dataset_base_path": normalize_path_for_resume(args.dataset_base_path),
+        "start_index": int(args.start_index),
+        "max_samples": args.max_samples,
+        "dataset_length": int(dataset_length),
+        "train_batch_size": int(args.train_batch_size),
+        "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+        "world_size": int(accelerator.num_processes),
+        "seed": int(args.seed),
+        "sampler_seed": int(args.seed),
+        "drop_last": False,
+        "random_flip": bool(args.random_flip),
+        "mixed_precision": args.mixed_precision,
+        "learning_rate": float(args.learning_rate),
+        "weight_decay": float(getattr(args, "weight_decay", 0.01)),
+        "lr_scheduler": args.lr_scheduler,
+        "lr_warmup_steps": int(args.lr_warmup_steps),
+        "max_pixels": args.max_pixels,
+        "native_resolution": bool(args.native_resolution),
+        "strict_native_size": bool(args.strict_native_size),
+        "lambda_l2": float(args.lambda_l2),
+        "lambda_lpips": float(args.lambda_lpips),
+        "lambda_vsd": float(args.lambda_vsd),
+        "lambda_vsd_lora": float(args.lambda_vsd_lora),
+        "lambda_keep": float(args.lambda_keep),
+        "lambda_bref": float(args.lambda_bref),
+        "lambda_gradient": float(args.lambda_gradient),
+        "lambda_laplacian": float(args.lambda_laplacian),
+        "max_train_steps": int(args.max_train_steps),
+        "checkpointing_steps": int(args.checkpointing_steps),
+        "validation_steps": int(args.validation_steps),
+        "validation_max_samples": int(args.validation_max_samples),
+        "logging_steps": int(args.logging_steps),
+        "output_dir": normalize_path_for_resume(args.output_dir),
+    }
+
+
+def validate_resume_configuration(*, saved_config, current_config, allowed_overrides=None):
+    allowed = RESUME_OVERRIDE_FIELDS if allowed_overrides is None else set(allowed_overrides)
+    problems = []
+    for field in sorted(RESUME_CONFIG_FIELDS):
+        if field not in saved_config:
+            problems.append((field, "<missing>", current_config.get(field, "<missing>")))
+            continue
+        if field not in current_config:
+            problems.append((field, saved_config.get(field), "<missing>"))
+            continue
+        if field in allowed:
+            continue
+        if saved_config[field] != current_config[field]:
+            problems.append((field, saved_config[field], current_config[field]))
+    if problems:
+        detail = "\n".join(f"* field={f}\n  checkpoint={a!r}\n  command_line={b!r}" for f, a, b in problems)
+        raise ValueError("[RESUME CONFIG MISMATCH]\n" + detail)
+    print("[RESUME] resume config validated")
+
+
 def validate_sampler_resume_state(trainer_state, *, dataset_length, world_size, train_batch_size,
                                   gradient_accumulation_steps, sampler_seed, drop_last, dataloader_length=None):
     if not trainer_state:
         return
+    if int(trainer_state.get("trainer_state_version", 2)) != 2:
+        _resume_mismatch("trainer_state_version", trainer_state.get("trainer_state_version"), 2)
     checks = {
         "dataset_length": dataset_length,
         "world_size": world_size,
@@ -257,10 +371,24 @@ def validate_sampler_resume_state(trainer_state, *, dataset_length, world_size, 
     batch_pos = int(trainer_state.get("batches_consumed_in_current_epoch", -1))
     if sampler_epoch < 0:
         _resume_mismatch("sampler_epoch", sampler_epoch, ">=0")
+    if int(trainer_state.get("current_epoch", sampler_epoch)) != sampler_epoch:
+        _resume_mismatch("current_epoch", trainer_state.get("current_epoch"), sampler_epoch)
     if batch_pos < 0:
         _resume_mismatch("batches_consumed_in_current_epoch", batch_pos, ">=0")
     if dataloader_length is not None and batch_pos > dataloader_length:
         _resume_mismatch("batches_consumed_in_current_epoch", batch_pos, f"<= {dataloader_length}")
+    global_step = int(trainer_state.get("global_step", -1))
+    if global_step < 0:
+        _resume_mismatch("global_step", global_step, ">=0")
+    if int(trainer_state.get("optimizer_updates", global_step)) != global_step:
+        _resume_mismatch("optimizer_updates", trainer_state.get("optimizer_updates"), global_step)
+    if int(trainer_state.get("scheduler_steps", global_step)) != global_step:
+        _resume_mismatch("scheduler_steps", trainer_state.get("scheduler_steps"), global_step)
+    if int(trainer_state.get("micro_batches", global_step)) < global_step:
+        _resume_mismatch("micro_batches", trainer_state.get("micro_batches"), f">= {global_step}")
+    if int(trainer_state.get("completed_epochs", 0)) > int(trainer_state.get("current_epoch", 0)):
+        _resume_mismatch("completed_epochs", trainer_state.get("completed_epochs"), f"<= {trainer_state.get('current_epoch')}")
+    print("[RESUME] sampler state validated")
 
 
 def broadcast_checkpoint_temp_dir(accelerator, temp_dir_on_main, final_dir):
@@ -341,17 +469,17 @@ def run_training_loop(*, accelerator, model, train_dataloader, optimizer, lr_sch
 
 def _groups(model, args, vsd=None):
     groups = []
-    named = _named_params(model.unet, lambda n, p: "lora" in n and p.requires_grad, "unet.")
+    named = sorted(_named_params(model.unet, lambda n, p: "lora" in n and p.requires_grad, "generator_unet."), key=lambda x: x[0])
     groups.append({"name": "generator_unet_lora", "params": [p for _, p in named], "parameter_names": [n for n, _ in named]})
     if args.train_conv_in:
         model.unet.conv_in.requires_grad_(True)
-        named = _named_params(model.unet.conv_in, lambda n, p: p.requires_grad, "unet.conv_in.")
+        named = sorted(_named_params(model.unet.conv_in, lambda n, p: p.requires_grad, "generator_conv_in."), key=lambda x: x[0])
         groups.append({"name": "generator_conv_in", "params": [p for _, p in named], "parameter_names": [n for n, _ in named]})
     if args.train_vae_lora:
-        named = _named_params(model.vae, lambda n, p: "lora" in n and p.requires_grad, "vae.")
+        named = sorted(_named_params(model.vae, lambda n, p: "lora" in n and p.requires_grad, "vae."), key=lambda x: x[0])
         groups.append({"name": "vae_lora", "params": [p for _, p in named], "parameter_names": [n for n, _ in named]})
     if vsd is not None:
-        named = _named_params(vsd.unet_update, lambda n, p: "lora" in n and p.requires_grad, "vsd.unet_update.")
+        named = sorted(_named_params(vsd.unet_update, lambda n, p: "lora" in n and p.requires_grad, "vsd_update_unet."), key=lambda x: x[0])
         groups.append({"name": "vsd_update_lora", "params": [p for _, p in named], "parameter_names": [n for n, _ in named]})
     groups = [g for g in groups if g["params"]]
     for g in groups:
@@ -488,10 +616,14 @@ def main(args):
     from osediff import OSEDiff_reg
     from osediff_focus_fusion import expand_unet_conv_in
 
-    if args.lora_rank is None:
-        args.lora_rank = args.lora_rank_vsd
+    if args.lora_rank is not None:
+        raise ValueError("--lora_rank is deprecated and no longer accepted. Use --lora_rank_unet, --lora_rank_vae and --lora_rank_vsd explicitly.")
     args.input_mode = normalize_input_mode(args.condition_mode or args.input_mode)
     verified_resume = load_verified_checkpoint(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
+    trainer_state = verified_resume["trainer_state"] if verified_resume else None
+    if verified_resume and verified_resume["manifest"]["global_step"] != trainer_state["global_step"]:
+        raise ValueError("[RESUME CONFIG MISMATCH]\n* field=global_step\n  checkpoint_manifest="
+                         f"{verified_resume['manifest']['global_step']!r}\n  trainer_state={trainer_state['global_step']!r}")
     resume_cfg = read_focus_checkpoint_config(verified_resume["model_state"]) if verified_resume else None
     validate_resume_config(args, resume_cfg)
     if args.input_mode != "ab_focus" and (args.lambda_keep or args.lambda_bref):
@@ -533,7 +665,13 @@ def main(args):
     model.lora_rank_vae = model.vae_lora_rank
     model.generator_lora_adapter_name = resume_cfg["generator_lora_adapter_name"] if resume_cfg else "focus_fusion"
     model.vae_lora_adapter_name = resume_cfg["vae_lora_adapter_name"] if resume_cfg else "focus_vae_encoder"
-    model_reg = OSEDiff_reg(args=args, accelerator=accelerator) if args.use_vsd else None
+    if args.use_vsd:
+        import copy
+        vsd_args = copy.deepcopy(args)
+        vsd_args.lora_rank = args.lora_rank_vsd
+        model_reg = OSEDiff_reg(args=vsd_args, accelerator=accelerator)
+    else:
+        model_reg = None
     if model_reg is not None:
         model_reg.set_train()
         assert model_reg.unet_fix.config.in_channels == 4
@@ -569,14 +707,14 @@ def main(args):
     val_dataset = FocusFusionDataset(args.metadata_path, args.dataset_base_path, args.resolution,
         False, False, False, args.validation_max_samples, 0, False, args.prompt_mode,
         args.native_resolution, args.strict_native_size, args.input_mode, sf, args.max_pixels)
-    start_epoch_for_sampler = int(resume_state.get("sampler_epoch", resume_state.get("completed_epochs", 0))) if resume_state else 0
+    start_epoch_for_sampler = int(trainer_state.get("sampler_epoch", trainer_state.get("current_epoch", 0))) if trainer_state else 0
     train_sampler = build_train_sampler(dataset, accelerator, args, start_epoch_for_sampler)
     loader = DataLoader(dataset, args.train_batch_size, shuffle=False, sampler=train_sampler,
                         num_workers=args.dataloader_num_workers, collate_fn=focus_fusion_collate)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=focus_fusion_collate)
     param_groups = _groups(model, args, model_reg)
-    current_manifest = optimizer_group_manifest(param_groups)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate, weight_decay=args.weight_decay)
+    current_manifest = optimizer_group_manifest(optimizer.param_groups)
     for group in optimizer.param_groups:
         print(
             f"optimizer group {group['name']}: tensors={len(group['params'])}, "
@@ -586,6 +724,21 @@ def main(args):
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles, power=args.lr_power)
+    current_resume_config = build_resume_config_snapshot(args, model=model, accelerator=accelerator, dataset_length=len(dataset))
+    if trainer_state:
+        validate_resume_configuration(saved_config=trainer_state["resume_config"], current_config=current_resume_config)
+        validate_sampler_resume_state(
+            trainer_state,
+            dataset_length=len(dataset),
+            dataloader_length=len(loader),
+            world_size=accelerator.num_processes,
+            train_batch_size=args.train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            sampler_seed=args.seed,
+            drop_last=False,
+        )
+        validate_optimizer_manifest(verified_resume["optimizer_manifest"], current_manifest)
+        print("[RESUME] optimizer manifest validated")
     if model_reg is None:
         model, text_encoder, optimizer, loader, lr_scheduler = accelerator.prepare(model, text_encoder, optimizer, loader, lr_scheduler)
     else:
@@ -594,7 +747,7 @@ def main(args):
         accelerator.load_state(str(Path(verified_resume["checkpoint_dir"], "accelerator_state")))
         print("[RESUME] accelerator state restored")
     resume_progress = resume_training_from_checkpoint(
-        resume_state=resume_state,
+        trainer_state=trainer_state,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
@@ -680,10 +833,14 @@ def main(args):
                 sampler_epoch=progress.current_epoch,
             )
             trainer_state = {
+                "trainer_state_version": 2,
                 "global_step": progress.global_step,
                 "current_epoch": progress.current_epoch,
                 "completed_epochs": progress.current_epoch,
                 "batches_consumed_in_current_epoch": progress.batches_consumed_in_current_epoch,
+                "micro_batches": progress.micro_batches,
+                "optimizer_updates": progress.global_step,
+                "scheduler_steps": progress.global_step,
                 "sampler_seed": args.seed,
                 "sampler_epoch": progress.current_epoch,
                 "dataset_length": len(dataset),
@@ -692,6 +849,7 @@ def main(args):
                 "train_batch_size": args.train_batch_size,
                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
                 "drop_last": False,
+                "resume_config": build_resume_config_snapshot(args, model=raw, accelerator=accelerator, dataset_length=len(dataset)),
             }
             torch.save(payload, temp_dir / "model_state.pt")
             write_json_atomically(temp_dir / "trainer_state.json", trainer_state)
@@ -716,7 +874,7 @@ def main(args):
         logging_fn=logging_callback,
         checkpointing_steps=args.checkpointing_steps,
         validation_steps=args.validation_steps,
-        logging_steps=10,
+        logging_steps=args.logging_steps,
         max_grad_norm=args.max_grad_norm,
     )
 

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from torch.utils.data import Dataset
 
-from train_osediff_focus_fusion import build_train_sampler
+from train_osediff_focus_fusion import build_train_sampler, validate_sampler_resume_state
 
 
 class IndexDataset(Dataset):
@@ -47,10 +47,42 @@ def test_epoch_boundary_changes_order_but_is_repeatable():
 
 
 def test_resume_metadata_rejects_world_size_or_dataset_length_change():
-    saved = {"world_size": 2, "dataset_length": 32}
-    current = {"world_size": 1, "dataset_length": 32}
-    with pytest.raises(AssertionError):
-        assert saved["world_size"] == current["world_size"]
-    current = {"world_size": 2, "dataset_length": 31}
-    with pytest.raises(AssertionError):
-        assert saved["dataset_length"] == current["dataset_length"]
+    saved = {
+        "world_size": 2,
+        "dataset_length": 32,
+        "train_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "sampler_seed": 123,
+        "drop_last": False,
+        "sampler_epoch": 0,
+        "batches_consumed_in_current_epoch": 0,
+    }
+    with pytest.raises(ValueError, match="world_size"):
+        validate_sampler_resume_state(saved, dataset_length=32, world_size=1, train_batch_size=1,
+                                      gradient_accumulation_steps=1, sampler_seed=123, drop_last=False)
+    with pytest.raises(ValueError, match="dataset_length"):
+        validate_sampler_resume_state(saved, dataset_length=31, world_size=2, train_batch_size=1,
+                                      gradient_accumulation_steps=1, sampler_seed=123, drop_last=False)
+    with pytest.raises(ValueError, match="sampler_seed"):
+        validate_sampler_resume_state(saved, dataset_length=32, world_size=2, train_batch_size=1,
+                                      gradient_accumulation_steps=1, sampler_seed=999, drop_last=False)
+    with pytest.raises(ValueError, match="drop_last"):
+        validate_sampler_resume_state(saved, dataset_length=32, world_size=2, train_batch_size=1,
+                                      gradient_accumulation_steps=1, sampler_seed=123, drop_last=True)
+
+
+def test_validate_sampler_resume_state_rejects_batch_position_overflow():
+    saved = {
+        "world_size": 1,
+        "dataset_length": 32,
+        "train_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "sampler_seed": 123,
+        "drop_last": False,
+        "sampler_epoch": 0,
+        "batches_consumed_in_current_epoch": 99,
+    }
+    with pytest.raises(ValueError, match="batches_consumed_in_current_epoch"):
+        validate_sampler_resume_state(saved, dataset_length=32, world_size=1, train_batch_size=1,
+                                      gradient_accumulation_steps=1, sampler_seed=123, drop_last=False,
+                                      dataloader_length=32)

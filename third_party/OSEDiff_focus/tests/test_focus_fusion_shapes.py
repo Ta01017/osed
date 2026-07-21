@@ -44,6 +44,9 @@ class DummyVAE:
 
         return SimpleNamespace(latent_dist=Dist(x))
 
+    def decode(self, x):
+        return SimpleNamespace(sample=x[:, :3])
+
 
 def test_input_mode_channels():
     assert INPUT_MODE_TO_CHANNELS == {"single": 4, "dual": 8, "ab_focus": 10, "quad_rgb": 16}
@@ -144,3 +147,20 @@ def test_tiled_invalid_overlap_errors(bad_overlap):
 def test_vsd_unet_stays_four_channel():
     u = DummyUNet()
     assert u.config.in_channels == 4
+
+
+def test_decode_latents_requires_expected_output_hw_and_checks_size():
+    model = FocusFusionGenerator(DummyUNet(), DummyVAE(), SimpleNamespace(), "single")
+    latents = torch.randn(1, 4, 8, 8)
+    assert model.decode_latents(latents, expected_output_hw=(8, 8)).shape == (1, 3, 8, 8)
+    with pytest.raises(RuntimeError, match="decoded output size mismatch"):
+        model.decode_latents(latents, expected_output_hw=(64, 64))
+    with pytest.raises(TypeError):
+        model.decode_latents(latents)
+
+
+def test_forward_from_latents_requires_expected_output_hw():
+    model = FocusFusionGenerator(DummyUNet(), DummyVAE(), SimpleNamespace(step=lambda *a, **k: SimpleNamespace(prev_sample=a[2])), "single")
+    z = [torch.randn(1, 4, 8, 8)]
+    with pytest.raises(TypeError):
+        model.forward_from_latents(z, prompt_embeds=torch.empty(1, 1, 1))

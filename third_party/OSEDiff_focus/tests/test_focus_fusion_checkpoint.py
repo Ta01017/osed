@@ -7,6 +7,9 @@ from osediff_focus_fusion import (
     capture_rng_state,
     checkpoint_payload,
     checkpoint_complete_path,
+    load_verified_checkpoint,
+    prepare_checkpoint_temp_dir,
+    finalize_checkpoint_directory,
     expand_unet_conv_in,
     load_focus_checkpoint,
     load_vae_lora_state,
@@ -14,7 +17,10 @@ from osediff_focus_fusion import (
     read_focus_checkpoint_config,
     restore_rng_state,
     write_checkpoint_complete_manifest,
+    write_json_atomically,
 )
+from train_osediff_focus_fusion import broadcast_checkpoint_temp_dir
+from train_osediff_focus_fusion import validate_optimizer_manifest
 
 
 class LoRAModule(torch.nn.Module):
@@ -85,7 +91,8 @@ def test_checkpoint_round_trip_generator_vae_vsd_lora():
         vsd.unet_update.adapter.lora_weight.fill_(5)
     state = checkpoint_payload(model, 7, _args(), vsd=vsd)
     cfg = read_focus_checkpoint_config(state)
-    assert cfg["input_mode"] == "dual" and cfg["global_step"] == 7
+    assert cfg["input_mode"] == "dual"
+    assert "global_step" not in state
 
     restored = TinyModel()
     load_focus_checkpoint(restored, state)
@@ -150,3 +157,72 @@ def test_checkpoint_complete_manifest_and_strict_file_load(tmp_path):
     assert checkpoint_complete_path(checkpoint).endswith(".complete.json")
     restored = TinyModel()
     load_focus_checkpoint(restored, str(checkpoint))
+
+
+def test_checkpoint_directory_atomic_finalize_preserves_accelerator_state(tmp_path):
+    final_dir = tmp_path / "checkpoint-00000001"
+    temp_dir = prepare_checkpoint_temp_dir(final_dir)
+    (temp_dir / "accelerator_state").mkdir()
+    write_json_atomically(temp_dir / "accelerator_state" / "rank0.json", {"ok": True})
+    payload = checkpoint_payload(TinyModel(), 1, _args())
+    trainer = {"global_step": 1}
+    optim = [{"name": "generator_unet_lora", "parameter_names": ["p"], "parameter_shapes": {"p": [2]}, "num_tensors": 1, "num_parameters": 2}]
+    torch.save(payload, temp_dir / "model_state.pt")
+    write_json_atomically(temp_dir / "trainer_state.json", trainer)
+    write_json_atomically(temp_dir / "optimizer_manifest.json", optim)
+    manifest = finalize_checkpoint_directory(temp_dir, final_dir, payload, trainer, optim)
+    assert manifest["accelerator_state_present"] is True
+    assert final_dir.is_dir()
+    assert not temp_dir.exists()
+    assert (final_dir / "accelerator_state" / "rank0.json").is_file()
+    verified = load_verified_checkpoint(final_dir)
+    assert verified["trainer_state"]["global_step"] == 1
+    with pytest.raises(FileExistsError):
+        prepare_checkpoint_temp_dir(final_dir)
+
+
+def test_verified_checkpoint_rejects_missing_accelerator_state(tmp_path):
+    final_dir = tmp_path / "checkpoint-00000001"
+    temp_dir = prepare_checkpoint_temp_dir(final_dir)
+    (temp_dir / "accelerator_state").mkdir()
+    write_json_atomically(temp_dir / "accelerator_state" / "rank0.json", {"ok": True})
+    payload = checkpoint_payload(TinyModel(), 1, _args())
+    trainer = {"global_step": 1}
+    optim = []
+    torch.save(payload, temp_dir / "model_state.pt")
+    write_json_atomically(temp_dir / "trainer_state.json", trainer)
+    write_json_atomically(temp_dir / "optimizer_manifest.json", optim)
+    finalize_checkpoint_directory(temp_dir, final_dir, payload, trainer, optim)
+    for child in (final_dir / "accelerator_state").iterdir():
+        child.unlink()
+    with pytest.raises(RuntimeError, match="accelerator_state"):
+        load_verified_checkpoint(final_dir)
+
+
+class SingleAccelerator:
+    num_processes = 1
+    is_main_process = True
+
+
+def test_broadcast_checkpoint_temp_dir_single_rank_exact_path(tmp_path):
+    final_dir = tmp_path / "checkpoint-00000007"
+    temp_dir = prepare_checkpoint_temp_dir(final_dir)
+    got = broadcast_checkpoint_temp_dir(SingleAccelerator(), temp_dir, final_dir)
+    assert got == temp_dir
+
+
+def test_optimizer_manifest_rejects_same_names_different_order():
+    saved = [{"name": "generator_unet_lora", "parameter_names": ["a", "b"], "parameter_shapes": {"a": [1], "b": [2]}, "num_tensors": 2, "num_parameters": 3, "lr": 1e-4, "weight_decay": 0.01}]
+    current = [{"name": "generator_unet_lora", "parameter_names": ["b", "a"], "parameter_shapes": {"a": [1], "b": [2]}, "num_tensors": 2, "num_parameters": 3, "lr": 1e-4, "weight_decay": 0.01}]
+    with pytest.raises(RuntimeError, match="OPTIMIZER MANIFEST MISMATCH"):
+        validate_optimizer_manifest(saved, current)
+
+
+def test_optimizer_manifest_rejects_lr_and_weight_decay_changes():
+    saved = [{"name": "generator_unet_lora", "parameter_names": ["a"], "parameter_shapes": {"a": [1]}, "num_tensors": 1, "num_parameters": 1, "lr": 1e-4, "weight_decay": 0.01}]
+    changed_lr = [{"name": "generator_unet_lora", "parameter_names": ["a"], "parameter_shapes": {"a": [1]}, "num_tensors": 1, "num_parameters": 1, "lr": 2e-4, "weight_decay": 0.01}]
+    with pytest.raises(RuntimeError, match="lr"):
+        validate_optimizer_manifest(saved, changed_lr)
+    changed_wd = [{"name": "generator_unet_lora", "parameter_names": ["a"], "parameter_shapes": {"a": [1]}, "num_tensors": 1, "num_parameters": 1, "lr": 1e-4, "weight_decay": 0.02}]
+    with pytest.raises(RuntimeError, match="weight_decay"):
+        validate_optimizer_manifest(saved, changed_wd)
