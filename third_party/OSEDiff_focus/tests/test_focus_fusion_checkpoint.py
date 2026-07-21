@@ -101,6 +101,21 @@ def _trainer_state(step=1, accumulation=1, **kw):
     return base
 
 
+def _write_verified_dir(tmp_path, *, step=1, trainer=None, payload=None, optim=None):
+    final_dir = tmp_path / f"checkpoint-{step:08d}"
+    temp_dir = prepare_checkpoint_temp_dir(final_dir)
+    (temp_dir / "accelerator_state").mkdir()
+    write_json_atomically(temp_dir / "accelerator_state" / "rank0.json", {"ok": True})
+    payload = payload if payload is not None else checkpoint_payload(TinyModel(), step, _args())
+    trainer = trainer if trainer is not None else _trainer_state(step)
+    optim = optim if optim is not None else []
+    torch.save(payload, temp_dir / "model_state.pt")
+    write_json_atomically(temp_dir / "trainer_state.json", trainer)
+    write_json_atomically(temp_dir / "optimizer_manifest.json", optim)
+    finalize_checkpoint_directory(temp_dir, final_dir, payload, trainer, optim)
+    return final_dir
+
+
 def test_checkpoint_round_trip_generator_vae_vsd_lora():
     model = TinyModel()
     vsd = TinyVSD()
@@ -252,11 +267,6 @@ def test_verified_checkpoint_rejects_corrupt_trainer_progress(tmp_path):
 
 
 def test_verified_checkpoint_accepts_partial_epoch_accumulation(tmp_path):
-    final_dir = tmp_path / "checkpoint-00000002"
-    temp_dir = prepare_checkpoint_temp_dir(final_dir)
-    (temp_dir / "accelerator_state").mkdir()
-    write_json_atomically(temp_dir / "accelerator_state" / "rank0.json", {"ok": True})
-    payload = checkpoint_payload(TinyModel(), 2, _args())
     trainer = _trainer_state(
         2,
         accumulation=4,
@@ -267,22 +277,13 @@ def test_verified_checkpoint_accepts_partial_epoch_accumulation(tmp_path):
         sampler_epoch=1,
         dataloader_length=6,
     )
-    optim = []
-    torch.save(payload, temp_dir / "model_state.pt")
-    write_json_atomically(temp_dir / "trainer_state.json", trainer)
-    write_json_atomically(temp_dir / "optimizer_manifest.json", optim)
-    finalize_checkpoint_directory(temp_dir, final_dir, payload, trainer, optim)
+    final_dir = _write_verified_dir(tmp_path, step=2, trainer=trainer)
     verified = load_verified_checkpoint(final_dir)
     assert verified["trainer_state"]["micro_batches"] == 6
     assert verified["trainer_state"]["global_step"] == 2
 
 
 def test_verified_checkpoint_rejects_version4_unnormalized_epoch_state(tmp_path):
-    final_dir = tmp_path / "checkpoint-00000002"
-    temp_dir = prepare_checkpoint_temp_dir(final_dir)
-    (temp_dir / "accelerator_state").mkdir()
-    write_json_atomically(temp_dir / "accelerator_state" / "rank0.json", {"ok": True})
-    payload = checkpoint_payload(TinyModel(), 2, _args())
     trainer = _trainer_state(
         2,
         accumulation=4,
@@ -290,12 +291,26 @@ def test_verified_checkpoint_rejects_version4_unnormalized_epoch_state(tmp_path)
         batches_consumed_in_current_epoch=6,
         dataloader_length=6,
     )
-    optim = []
-    torch.save(payload, temp_dir / "model_state.pt")
-    write_json_atomically(temp_dir / "trainer_state.json", trainer)
-    write_json_atomically(temp_dir / "optimizer_manifest.json", optim)
-    finalize_checkpoint_directory(temp_dir, final_dir, payload, trainer, optim)
+    final_dir = _write_verified_dir(tmp_path, step=2, trainer=trainer)
     with pytest.raises(RuntimeError, match="version 4"):
+        load_verified_checkpoint(final_dir)
+
+
+def test_verified_checkpoint_rejects_step_counter_corruption(tmp_path):
+    with pytest.raises(RuntimeError, match="optimizer_updates"):
+        load_verified_checkpoint(_write_verified_dir(tmp_path / "a", step=2, trainer=_trainer_state(2, optimizer_updates=1)))
+    with pytest.raises(RuntimeError, match="scheduler_steps"):
+        load_verified_checkpoint(_write_verified_dir(tmp_path / "b", step=2, trainer=_trainer_state(2, scheduler_steps=1)))
+
+
+def test_verified_checkpoint_rejects_manifest_trainer_step_mismatch(tmp_path):
+    final_dir = _write_verified_dir(tmp_path, step=2, trainer=_trainer_state(2))
+    manifest_path = final_dir / "checkpoint_complete.json"
+    import json
+    manifest = json.loads(manifest_path.read_text())
+    manifest["global_step"] = 3
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="global_step mismatch"):
         load_verified_checkpoint(final_dir)
 
 

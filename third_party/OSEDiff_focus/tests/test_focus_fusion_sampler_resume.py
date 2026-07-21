@@ -187,3 +187,41 @@ def test_validate_sampler_resume_state_rejects_version4_epoch_tail_position():
             drop_last=False,
             dataloader_length=6,
         )
+
+
+def test_partial_checkpoint_resume_starts_at_next_epoch_without_repeating_tail():
+    epoch0 = _order(n=6, epoch=0)
+    epoch1 = _order(n=6, epoch=1)
+    saved = {
+        "trainer_state_version": 4,
+        "world_size": 1,
+        "dataset_length": 6,
+        "train_batch_size": 1,
+        "gradient_accumulation_steps": 4,
+        "sync_with_dataloader": True,
+        "sampler_seed": 123,
+        "drop_last": False,
+        "current_epoch": 1,
+        "sampler_epoch": 1,
+        "completed_epochs": 1,
+        "batches_consumed_in_current_epoch": 0,
+        "global_step": 2,
+        "optimizer_updates": 2,
+        "scheduler_steps": 2,
+        "micro_batches": 6,
+    }
+    validate_sampler_resume_state(
+        saved,
+        dataset_length=6,
+        world_size=1,
+        train_batch_size=1,
+        gradient_accumulation_steps=4,
+        sync_with_dataloader=True,
+        sampler_seed=123,
+        drop_last=False,
+        dataloader_length=6,
+    )
+    resumed_order = _order(n=6, epoch=saved["sampler_epoch"])[saved["batches_consumed_in_current_epoch"]:]
+    assert resumed_order == epoch1
+    assert resumed_order[0] == epoch1[0]
+    assert resumed_order != epoch0[-1:]

@@ -10,10 +10,14 @@ from train_osediff_focus_fusion import (
     normalize_model_identifier,
     TrainingProgress,
     log_accelerator_resume_success,
+    run_from_args,
     validate_sampler_resume_state,
     validate_resume_configuration,
     validate_resume_config,
 )
+from torch.utils.data import DataLoader, TensorDataset
+
+from test_focus_fusion_training_steps import TailSyncAccelerator, Tiny, CountingScheduler
 
 
 def _args(**kw):
@@ -274,3 +278,38 @@ def test_validate_sampler_resume_state_accepts_partial_accumulation():
             drop_last=False,
             dataloader_length=6,
         )
+
+
+def test_partial_state_enters_formal_run_from_args_and_updates():
+    loader = DataLoader(TensorDataset(torch.ones(6, 1)), batch_size=1)
+    model = Tiny()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = CountingScheduler()
+    args = SimpleNamespace(
+        gradient_accumulation_steps=4,
+        max_train_steps=3,
+        checkpointing_steps=0,
+        validation_steps=0,
+        logging_steps=10,
+        max_grad_norm=None,
+    )
+    progress = run_from_args(args, dependencies={
+        "accelerator": TailSyncAccelerator(4, len(loader)),
+        "model": model,
+        "train_dataloader": loader,
+        "optimizer": optimizer,
+        "lr_scheduler": scheduler,
+        "compute_loss_fn": lambda m, b: m(b),
+        "trainer_state": {
+            "global_step": 2,
+            "current_epoch": 1,
+            "completed_epochs": 1,
+            "batches_consumed_in_current_epoch": 0,
+            "micro_batches": 6,
+            "optimizer_updates": 2,
+            "scheduler_steps": 2,
+            "sampler_epoch": 1,
+        },
+    })
+    assert progress.global_step == 3
+    assert progress.optimizer_updates == 3

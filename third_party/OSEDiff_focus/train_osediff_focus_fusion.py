@@ -255,6 +255,23 @@ def validate_training_progress(progress: TrainingProgress, *, gradient_accumulat
         raise ValueError(f"[INVALID TRAINING PROGRESS] batches_consumed_in_current_epoch={progress.batches_consumed_in_current_epoch} dataloader_length={dataloader_length}")
 
 
+def normalize_epoch_end_if_needed(progress: TrainingProgress, *, dataloader_length: int) -> bool:
+    """Normalize completed epoch state before callbacks/checkpointing."""
+    if progress.batches_consumed_in_current_epoch < dataloader_length:
+        return False
+    if progress.batches_consumed_in_current_epoch > dataloader_length:
+        raise ValueError(
+            "[INVALID TRAINING PROGRESS] "
+            f"batches_consumed_in_current_epoch={progress.batches_consumed_in_current_epoch} "
+            f"dataloader_length={dataloader_length}"
+        )
+    progress.completed_epochs += 1
+    progress.current_epoch += 1
+    progress.sampler_epoch = progress.current_epoch
+    progress.batches_consumed_in_current_epoch = 0
+    return True
+
+
 def validate_resume_config(args, resume_cfg):
     """Validate structural resume fields and copy checkpoint-owned structure onto args."""
     if not resume_cfg:
@@ -520,13 +537,15 @@ def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, op
     """Shared optimizer-update loop used by formal training tests and main-like code."""
     optimizer.zero_grad(set_to_none=True)
     validate_training_progress(progress, gradient_accumulation_steps=gradient_accumulation_steps, dataloader_length=len(train_dataloader) if hasattr(train_dataloader, "__len__") else None)
+    dataloader_length = len(train_dataloader) if hasattr(train_dataloader, "__len__") else None
     while progress.global_step < max_train_steps:
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(progress.sampler_epoch)
-        epoch_exhausted = True
+        epoch_was_normalized = False
         for batch_index, batch in enumerate(train_dataloader):
             if batch_index < progress.batches_consumed_in_current_epoch:
                 continue
+            progress.batches_consumed_in_current_epoch = batch_index + 1
             with accelerator.accumulate(model):
                 result = compute_loss_fn(model, batch) if compute_loss_fn else model(batch)
                 if isinstance(result, tuple):
@@ -560,8 +579,10 @@ def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, op
                         "global_step_before": before_step,
                         "global_step_after": progress.global_step,
                     })
-            progress.batches_consumed_in_current_epoch = batch_index + 1
             if accelerator.sync_gradients:
+                if dataloader_length is not None:
+                    epoch_was_normalized = normalize_epoch_end_if_needed(progress, dataloader_length=dataloader_length)
+                validate_training_progress(progress, gradient_accumulation_steps=gradient_accumulation_steps, dataloader_length=dataloader_length)
                 if logging_fn and (progress.global_step == 1 or (logging_steps and progress.global_step % logging_steps == 0)):
                     logging_fn(progress, losses)
                 if validation_steps and progress.global_step % validation_steps == 0 and validation_fn:
@@ -569,19 +590,11 @@ def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, op
                 if checkpointing_steps and progress.global_step % checkpointing_steps == 0 and checkpoint_fn:
                     checkpoint_fn(progress, losses)
             if progress.global_step >= max_train_steps:
-                if hasattr(train_dataloader, "__len__") and progress.batches_consumed_in_current_epoch == len(train_dataloader):
-                    progress.completed_epochs += 1
-                    progress.current_epoch += 1
-                    progress.sampler_epoch = progress.current_epoch
-                    progress.batches_consumed_in_current_epoch = 0
-                epoch_exhausted = False
-                break
-        if epoch_exhausted:
-            progress.completed_epochs += 1
-            progress.current_epoch += 1
-            progress.sampler_epoch = progress.current_epoch
-            progress.batches_consumed_in_current_epoch = 0
-    validate_training_progress(progress, gradient_accumulation_steps=gradient_accumulation_steps, dataloader_length=len(train_dataloader) if hasattr(train_dataloader, "__len__") else None)
+                validate_training_progress(progress, gradient_accumulation_steps=gradient_accumulation_steps, dataloader_length=dataloader_length)
+                return progress
+        if dataloader_length is not None and not epoch_was_normalized:
+            normalize_epoch_end_if_needed(progress, dataloader_length=dataloader_length)
+    validate_training_progress(progress, gradient_accumulation_steps=gradient_accumulation_steps, dataloader_length=dataloader_length)
     return progress
 
 
@@ -723,7 +736,40 @@ def run_validation(model, loader, encode_fn, args, accelerator, step):
             raw_model.train()
 
 
-def main(args):
+def run_from_args(args, *, dependencies=None):
+    if dependencies is None:
+        return run_real_training(args)
+    progress = dependencies.get("progress") or TrainingProgress()
+    if dependencies.get("trainer_state"):
+        progress = TrainingProgress.from_trainer_state(dependencies["trainer_state"])
+    return run_training_loop(
+        accelerator=dependencies["accelerator"],
+        model=dependencies["model"],
+        train_dataloader=dependencies["train_dataloader"],
+        train_sampler=dependencies.get("train_sampler"),
+        optimizer=dependencies["optimizer"],
+        lr_scheduler=dependencies["lr_scheduler"],
+        progress=progress,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_train_steps=args.max_train_steps,
+        checkpointing_steps=getattr(args, "checkpointing_steps", 0),
+        validation_steps=getattr(args, "validation_steps", 0),
+        compute_loss_fn=dependencies.get("compute_loss_fn"),
+        checkpoint_fn=dependencies.get("checkpoint_fn"),
+        validation_fn=dependencies.get("validation_fn"),
+        logging_fn=dependencies.get("logging_fn"),
+        event_callback=dependencies.get("event_callback"),
+        logging_steps=getattr(args, "logging_steps", 10),
+        max_grad_norm=getattr(args, "max_grad_norm", None),
+    )
+
+
+def main(cli_args=None):
+    args = parse_args(cli_args) if not hasattr(cli_args, "pretrained_model_name_or_path") else cli_args
+    return run_from_args(args)
+
+
+def run_real_training(args):
     from accelerate import Accelerator
     from accelerate.utils import GradientAccumulationPlugin, set_seed
     from diffusers import DDPMScheduler
@@ -937,6 +983,10 @@ def main(args):
         accelerator.save_state(str(accelerator_state_dir))
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            if progress.batches_consumed_in_current_epoch == len(loader):
+                raise RuntimeError(
+                    "[INVALID TRAINER STATE] version 4 checkpoint must normalize completed epoch before saving"
+                )
             validate_training_progress(progress, gradient_accumulation_steps=args.gradient_accumulation_steps, dataloader_length=len(loader))
             raw = accelerator.unwrap_model(model)
             raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
@@ -968,7 +1018,7 @@ def main(args):
             finalize_checkpoint_directory(temp_dir, checkpoint_dir, payload, trainer_state, current_manifest)
         accelerator.wait_for_everyone()
 
-    run_training_loop(
+    return run_training_loop(
         accelerator=accelerator,
         model=model,
         train_dataloader=loader,
@@ -989,4 +1039,4 @@ def main(args):
     )
 
 
-if __name__ == "__main__": main(parse_args())
+if __name__ == "__main__": main()

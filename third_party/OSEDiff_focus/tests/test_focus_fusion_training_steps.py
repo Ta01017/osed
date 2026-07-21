@@ -4,7 +4,14 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from train_osediff_focus_fusion import TrainingProgress, run_training_loop, simulate_optimizer_update_schedule, validate_training_progress
+from train_osediff_focus_fusion import (
+    TrainingProgress,
+    normalize_epoch_end_if_needed,
+    run_from_args,
+    run_training_loop,
+    simulate_optimizer_update_schedule,
+    validate_training_progress,
+)
 
 
 class CountingAccelerator:
@@ -93,6 +100,9 @@ def test_run_training_loop_resume_counts_only_remaining_updates():
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     scheduler = CountingScheduler()
     loader = DataLoader(TensorDataset(torch.ones(20, 1)), batch_size=1)
+    initial = TrainingProgress(global_step=1, optimizer_updates=1, scheduler_steps=1, micro_batches=4)
+    initial_optimizer_updates = initial.optimizer_updates
+    initial_scheduler_steps = initial.scheduler_steps
     result = run_training_loop(
         accelerator=CountingAccelerator(4),
         model=model,
@@ -101,13 +111,16 @@ def test_run_training_loop_resume_counts_only_remaining_updates():
         optimizer=optimizer,
         lr_scheduler=scheduler,
         max_train_steps=3,
-        progress=TrainingProgress(global_step=1, optimizer_updates=1, scheduler_steps=1, micro_batches=4),
+        progress=initial,
         gradient_accumulation_steps=4,
         compute_loss_fn=lambda m, b: m(b),
     )
-    assert result.optimizer_updates == 2
-    assert result.scheduler_steps == 2
     assert result.global_step == 3
+    assert result.optimizer_updates == 3
+    assert result.scheduler_steps == 3
+    assert result.micro_batches == 12
+    assert result.optimizer_updates - initial_optimizer_updates == 2
+    assert result.scheduler_steps - initial_scheduler_steps == 2
 
 
 def test_simulation_remains_auxiliary_only():
@@ -179,6 +192,46 @@ def test_partial_epoch_accumulation_uses_sync_events_not_formula():
     validate_training_progress(progress, gradient_accumulation_steps=4, dataloader_length=len(loader))
 
 
+def test_epoch_tail_is_normalized_before_callbacks():
+    loader = DataLoader(TensorDataset(torch.ones(6, 1)), batch_size=1)
+    model = Tiny()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = CountingScheduler()
+    checkpoint_states = []
+    validation_states = []
+    progress = run_training_loop(
+        accelerator=TailSyncAccelerator(4, len(loader)),
+        model=model,
+        train_dataloader=loader,
+        train_sampler=None,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        progress=TrainingProgress(),
+        gradient_accumulation_steps=4,
+        max_train_steps=2,
+        checkpointing_steps=1,
+        validation_steps=1,
+        compute_loss_fn=lambda m, b: m(b),
+        checkpoint_fn=lambda p, losses: checkpoint_states.append(p.to_trainer_state_fields()),
+        validation_fn=lambda p: validation_states.append(p.to_trainer_state_fields()),
+    )
+    assert progress.current_epoch == 1
+    assert progress.completed_epochs == 1
+    assert progress.sampler_epoch == 1
+    assert progress.batches_consumed_in_current_epoch == 0
+    assert checkpoint_states[-1]["current_epoch"] == 1
+    assert checkpoint_states[-1]["batches_consumed_in_current_epoch"] == 0
+    assert validation_states[-1]["batches_consumed_in_current_epoch"] == 0
+
+
+def test_normalize_epoch_end_if_needed_is_idempotent_after_normal_state():
+    progress = TrainingProgress(current_epoch=0, completed_epochs=0, sampler_epoch=0, batches_consumed_in_current_epoch=6)
+    assert normalize_epoch_end_if_needed(progress, dataloader_length=6) is True
+    assert progress.current_epoch == progress.completed_epochs == progress.sampler_epoch == 1
+    assert progress.batches_consumed_in_current_epoch == 0
+    assert normalize_epoch_end_if_needed(progress, dataloader_length=6) is False
+
+
 def test_validate_training_progress_rejects_counter_mismatch():
     with pytest.raises(ValueError, match="optimizer_updates"):
         validate_training_progress(TrainingProgress(global_step=2, optimizer_updates=1, scheduler_steps=2), gradient_accumulation_steps=1)
@@ -205,3 +258,68 @@ def test_production_code_does_not_assume_full_accumulation_per_update():
         assert "micro_batches >=\n            global_step *" not in text
         assert "micro_batches ==\n            global_step *" not in text
         assert "expected_min_micro_batches" not in text
+
+
+def test_main_entrypoint_runs_one_cpu_update():
+    loader = DataLoader(TensorDataset(torch.ones(4, 1)), batch_size=1)
+    model = Tiny()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = CountingScheduler()
+    args = type("Args", (), {
+        "gradient_accumulation_steps": 1,
+        "max_train_steps": 1,
+        "checkpointing_steps": 0,
+        "validation_steps": 0,
+        "logging_steps": 10,
+        "max_grad_norm": None,
+    })()
+    progress = run_from_args(args, dependencies={
+        "accelerator": CountingAccelerator(1),
+        "model": model,
+        "train_dataloader": loader,
+        "optimizer": optimizer,
+        "lr_scheduler": scheduler,
+        "compute_loss_fn": lambda m, b: m(b),
+    })
+    assert progress.global_step == 1
+    assert progress.optimizer_updates == 1
+    assert progress.scheduler_steps == 1
+
+
+def test_main_entrypoint_resumes_partial_epoch_checkpoint():
+    loader = DataLoader(TensorDataset(torch.ones(6, 1)), batch_size=1)
+    model = Tiny()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = CountingScheduler()
+    args = type("Args", (), {
+        "gradient_accumulation_steps": 4,
+        "max_train_steps": 3,
+        "checkpointing_steps": 0,
+        "validation_steps": 0,
+        "logging_steps": 10,
+        "max_grad_norm": None,
+    })()
+    trainer_state = {
+        "global_step": 2,
+        "current_epoch": 1,
+        "completed_epochs": 1,
+        "batches_consumed_in_current_epoch": 0,
+        "micro_batches": 6,
+        "optimizer_updates": 2,
+        "scheduler_steps": 2,
+        "sampler_epoch": 1,
+    }
+    progress = run_from_args(args, dependencies={
+        "accelerator": TailSyncAccelerator(4, len(loader)),
+        "model": model,
+        "train_dataloader": loader,
+        "optimizer": optimizer,
+        "lr_scheduler": scheduler,
+        "compute_loss_fn": lambda m, b: m(b),
+        "trainer_state": trainer_state,
+    })
+    assert progress.global_step == 3
+    assert progress.optimizer_updates == 3
+    assert progress.scheduler_steps == 3
+    assert progress.micro_batches > 6
+    assert progress.current_epoch == 1

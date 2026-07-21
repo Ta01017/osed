@@ -121,16 +121,121 @@ if [[ "$RUN_PARTIAL_EPOCH_TEST" == "1" ]]; then
    --max_samples 6 --max_train_steps 2 --checkpointing_steps 1 --validation_steps 0 --validation_max_samples 1 \
    --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" 2>&1 | tee "$PARTIAL_LOG"
   code=${PIPESTATUS[0]}; set -e; [[ "$code" == "0" ]] || { echo "[SMOKE FAIL] partial epoch command failed: $code" >&2; exit "$code"; }
+  PARTIAL_CHECKPOINT="$PARTIAL_DIR/checkpoints/checkpoint-00000002"
+  python - "$PARTIAL_CHECKPOINT" <<'PY'
+import json, sys
+from pathlib import Path
+from osediff_focus_fusion import load_verified_checkpoint
+ckpt = Path(sys.argv[1])
+state = load_verified_checkpoint(ckpt)
+trainer = state["trainer_state"]
+assert trainer["global_step"] == trainer["optimizer_updates"] == trainer["scheduler_steps"]
+assert trainer["global_step"] == 2
+assert trainer["micro_batches"] == 6
+assert trainer["gradient_accumulation_steps"] == 4
+assert trainer["sync_with_dataloader"] is True
+assert trainer["current_epoch"] == trainer["sampler_epoch"] == trainer["completed_epochs"] == 1
+assert trainer["batches_consumed_in_current_epoch"] == 0
+print(json.dumps(trainer, sort_keys=True))
+PY
+  PARTIAL_RESUME_LOG="$PARTIAL_DIR/partial_epoch_resume.log"
+  set +e
+  CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
+   --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$PARTIAL_DIR" \
+   --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps 4 --sync_with_dataloader \
+   --lora_rank_unet "$LORA_RANK_UNET" --lora_rank_vae "$LORA_RANK_VAE" --lora_rank_vsd "$LORA_RANK_VSD" \
+   --max_samples 6 --max_train_steps 3 --checkpointing_steps 1 --validation_steps 0 --validation_max_samples 1 \
+   --resume_from_checkpoint "$PARTIAL_CHECKPOINT" --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" 2>&1 | tee "$PARTIAL_RESUME_LOG"
+  code=${PIPESTATUS[0]}; set -e; [[ "$code" == "0" ]] || { echo "[SMOKE FAIL] partial epoch resume failed: $code" >&2; exit "$code"; }
   python - "$PARTIAL_DIR" <<'PY'
 import json, sys
 from pathlib import Path
+from osediff_focus_fusion import load_verified_checkpoint
 out = Path(sys.argv[1])
-ckpt = out / "checkpoints" / "checkpoint-00000002"
-trainer = json.loads((ckpt / "trainer_state.json").read_text())
-assert trainer["global_step"] == trainer["optimizer_updates"] == trainer["scheduler_steps"]
-assert trainer["micro_batches"] >= trainer["optimizer_updates"]
-assert trainer["gradient_accumulation_steps"] == 4
-assert trainer["sync_with_dataloader"] is True
+step2 = load_verified_checkpoint(out / "checkpoints" / "checkpoint-00000002")["trainer_state"]
+step3 = load_verified_checkpoint(out / "checkpoints" / "checkpoint-00000003")["trainer_state"]
+assert step3["global_step"] == step3["optimizer_updates"] == step3["scheduler_steps"] == 3
+assert step3["micro_batches"] > step2["micro_batches"]
 print("[PARTIAL EPOCH SMOKE PASS]")
 PY
 fi
+
+mutate_checkpoint() {
+  local src="$1" dst="$2" expr="$3"
+  rm -rf "$dst"
+  cp -a "$src" "$dst"
+  python - "$dst" "$expr" <<'PY'
+import json, sys, os, hashlib
+from pathlib import Path
+ckpt = Path(sys.argv[1]); expr = sys.argv[2]
+trainer_path = ckpt / "trainer_state.json"
+manifest_path = ckpt / "checkpoint_complete.json"
+trainer = json.loads(trainer_path.read_text())
+manifest = json.loads(manifest_path.read_text())
+ns = {"trainer": trainer, "manifest": manifest}
+exec(expr, ns, ns)
+trainer_path.write_text(json.dumps(trainer, sort_keys=True), encoding="utf-8")
+entry = manifest["trainer_state"]
+data = trainer_path.read_bytes()
+entry["size"] = len(data)
+entry["sha256"] = hashlib.sha256(data).hexdigest()
+manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+PY
+}
+
+mutate_optimizer_manifest() {
+  local src="$1" dst="$2"
+  rm -rf "$dst"
+  cp -a "$src" "$dst"
+  python - "$dst" <<'PY'
+import json, sys, hashlib
+from pathlib import Path
+ckpt = Path(sys.argv[1])
+manifest_path = ckpt / "checkpoint_complete.json"
+optim_path = ckpt / "optimizer_manifest.json"
+manifest = json.loads(manifest_path.read_text())
+optim = json.loads(optim_path.read_text())
+for group in optim:
+    names = group.get("parameter_names", [])
+    if len(names) >= 2:
+        names[0], names[1] = names[1], names[0]
+        break
+else:
+    optim[0].setdefault("parameter_names", ["a", "b"])
+    optim[0]["parameter_names"][0], optim[0]["parameter_names"][1] = "b", "a"
+optim_path.write_text(json.dumps(optim, sort_keys=True), encoding="utf-8")
+data = optim_path.read_bytes()
+manifest["optimizer_manifest"]["size"] = len(data)
+manifest["optimizer_manifest"]["sha256"] = hashlib.sha256(data).hexdigest()
+manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+PY
+}
+
+expect_resume_fail() {
+  local bad_ckpt="$1" log="$2" needle="$3"
+  set +e
+  CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
+   --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
+   --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" --sync_with_dataloader \
+   --lora_rank_unet "$LORA_RANK_UNET" --lora_rank_vae "$LORA_RANK_VAE" --lora_rank_vsd "$LORA_RANK_VSD" \
+   --max_samples 16 --max_train_steps 3 --checkpointing_steps 1 --validation_steps 0 --validation_max_samples 1 \
+   --resume_from_checkpoint "$bad_ckpt" --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" >"$log" 2>&1
+  code=$?; set -e
+  [[ "$code" != "0" ]] || { echo "[NEGATIVE SMOKE FAIL] corrupt checkpoint resumed successfully: $bad_ckpt" >&2; exit 1; }
+  grep -Fq "$needle" "$log" || { echo "[NEGATIVE SMOKE FAIL] missing expected error '$needle' in $log" >&2; exit 1; }
+}
+
+BAD_ROOT="$OUTPUT_DIR/bad_checkpoints"; mkdir -p "$BAD_ROOT"
+mutate_checkpoint "$OUTPUT_DIR/checkpoints/checkpoint-00000002" "$BAD_ROOT/bad_optimizer_updates" 'trainer["optimizer_updates"]=1'
+expect_resume_fail "$BAD_ROOT/bad_optimizer_updates" "$BAD_ROOT/bad_optimizer_updates.log" "optimizer_updates"
+mutate_checkpoint "$OUTPUT_DIR/checkpoints/checkpoint-00000002" "$BAD_ROOT/bad_scheduler_steps" 'trainer["scheduler_steps"]=1'
+expect_resume_fail "$BAD_ROOT/bad_scheduler_steps" "$BAD_ROOT/bad_scheduler_steps.log" "scheduler_steps"
+mutate_checkpoint "$OUTPUT_DIR/checkpoints/checkpoint-00000002" "$BAD_ROOT/bad_micro_batches" 'trainer["micro_batches"]=1'
+expect_resume_fail "$BAD_ROOT/bad_micro_batches" "$BAD_ROOT/bad_micro_batches.log" "micro_batches"
+mutate_checkpoint "$OUTPUT_DIR/checkpoints/checkpoint-00000002" "$BAD_ROOT/bad_manifest_step" 'manifest["global_step"]=3'
+expect_resume_fail "$BAD_ROOT/bad_manifest_step" "$BAD_ROOT/bad_manifest_step.log" "global_step mismatch"
+mutate_checkpoint "$OUTPUT_DIR/checkpoints/checkpoint-00000002" "$BAD_ROOT/bad_resume_config" 'trainer["resume_config"]["learning_rate"]=999.0'
+expect_resume_fail "$BAD_ROOT/bad_resume_config" "$BAD_ROOT/bad_resume_config.log" "[RESUME CONFIG MISMATCH]"
+mutate_optimizer_manifest "$OUTPUT_DIR/checkpoints/checkpoint-00000002" "$BAD_ROOT/bad_optimizer_order"
+expect_resume_fail "$BAD_ROOT/bad_optimizer_order" "$BAD_ROOT/bad_optimizer_order.log" "[OPTIMIZER MANIFEST MISMATCH]"
+echo "[NEGATIVE RESUME SMOKE PASS]"

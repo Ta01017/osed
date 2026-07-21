@@ -318,6 +318,16 @@ def load_verified_checkpoint(checkpoint_path):
             "[INVALID TRAINER STATE] "
             f"micro_batches={trainer_state['micro_batches']} optimizer_updates={global_step}"
         )
+    if int(trainer_state["completed_epochs"]) > int(trainer_state["current_epoch"]):
+        raise RuntimeError(
+            "[INVALID TRAINER STATE] "
+            f"completed_epochs={trainer_state['completed_epochs']} current_epoch={trainer_state['current_epoch']}"
+        )
+    if int(trainer_state["sampler_epoch"]) != int(trainer_state["current_epoch"]):
+        raise RuntimeError(
+            "[INVALID TRAINER STATE] "
+            f"sampler_epoch={trainer_state['sampler_epoch']} current_epoch={trainer_state['current_epoch']}"
+        )
     if int(trainer_state.get("trainer_state_version", 3)) >= 4:
         dataloader_length = trainer_state.get("dataloader_length")
         if dataloader_length is not None and int(trainer_state["batches_consumed_in_current_epoch"]) == int(dataloader_length):
