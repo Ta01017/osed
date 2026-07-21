@@ -26,6 +26,20 @@ class CountingAccelerator:
         torch.nn.utils.clip_grad_norm_(list(params), max_norm)
 
 
+class TailSyncAccelerator(CountingAccelerator):
+    def __init__(self, accumulation, dataloader_length):
+        super().__init__(accumulation)
+        self.dataloader_length = dataloader_length
+
+    @contextlib.contextmanager
+    def accumulate(self, model):
+        is_full_step = (self.micro + 1) % self.accumulation == 0
+        is_epoch_tail = (self.micro + 1) == self.dataloader_length
+        self.sync_gradients = is_full_step or is_epoch_tail
+        yield
+        self.micro += 1
+
+
 class Tiny(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -134,6 +148,60 @@ def test_accumulation_four_continuous_resume_4_8_12():
         validate_training_progress(progress, gradient_accumulation_steps=4, dataloader_length=len(loader))
 
 
+def test_partial_epoch_accumulation_uses_sync_events_not_formula():
+    loader = DataLoader(TensorDataset(torch.ones(6, 1)), batch_size=1)
+    model = Tiny()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = CountingScheduler()
+    events = []
+    progress = run_training_loop(
+        accelerator=TailSyncAccelerator(4, len(loader)),
+        model=model,
+        train_dataloader=loader,
+        train_sampler=None,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        progress=TrainingProgress(),
+        gradient_accumulation_steps=4,
+        max_train_steps=2,
+        compute_loss_fn=lambda m, b: m(b),
+        event_callback=events.append,
+    )
+    sync_events = [e for e in events if e["event"] == "micro_batch" and e["sync_gradients"]]
+    assert [e["batch_index"] for e in sync_events] == [3, 5]
+    assert progress.micro_batches == 6
+    assert progress.global_step == len(sync_events)
+    assert progress.optimizer_updates == len(sync_events)
+    assert progress.scheduler_steps == len(sync_events)
+    assert progress.current_epoch == 1
+    assert progress.completed_epochs == 1
+    assert progress.batches_consumed_in_current_epoch == 0
+    validate_training_progress(progress, gradient_accumulation_steps=4, dataloader_length=len(loader))
+
+
 def test_validate_training_progress_rejects_counter_mismatch():
     with pytest.raises(ValueError, match="optimizer_updates"):
         validate_training_progress(TrainingProgress(global_step=2, optimizer_updates=1, scheduler_steps=2), gradient_accumulation_steps=1)
+
+
+def test_validate_training_progress_accepts_legal_partial_accumulation_state():
+    progress = TrainingProgress(
+        global_step=2,
+        current_epoch=1,
+        completed_epochs=1,
+        batches_consumed_in_current_epoch=0,
+        micro_batches=6,
+        optimizer_updates=2,
+        scheduler_steps=2,
+        sampler_epoch=1,
+    )
+    validate_training_progress(progress, gradient_accumulation_steps=4, dataloader_length=6)
+
+
+def test_production_code_does_not_assume_full_accumulation_per_update():
+    root = __import__("pathlib").Path(__file__).resolve().parents[1]
+    for rel in ("train_osediff_focus_fusion.py", "osediff_focus_fusion.py"):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert "micro_batches >=\n            global_step *" not in text
+        assert "micro_batches ==\n            global_step *" not in text
+        assert "expected_min_micro_batches" not in text

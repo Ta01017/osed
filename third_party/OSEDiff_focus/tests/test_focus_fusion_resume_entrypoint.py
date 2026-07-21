@@ -27,6 +27,7 @@ def _args(**kw):
         train_vae_lora=False,
         use_vsd=0,
         prompt_mode="fixed",
+        sync_with_dataloader=True,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -104,6 +105,7 @@ def test_validate_sampler_resume_state_rejects_runtime_mismatches():
         "world_size": 2,
         "train_batch_size": 1,
         "gradient_accumulation_steps": 4,
+        "sync_with_dataloader": True,
         "sampler_seed": 123,
         "drop_last": False,
         "sampler_epoch": 1,
@@ -126,6 +128,7 @@ def test_validate_sampler_resume_state_rejects_runtime_mismatches():
             world_size=2,
             train_batch_size=1,
             gradient_accumulation_steps=4,
+            sync_with_dataloader=True,
             sampler_seed=123,
             drop_last=False,
         )
@@ -160,10 +163,12 @@ def test_parse_args_classifies_all_current_cli_fields():
         "--lr_power", "0.5",
         "--max_grad_norm", "0.7",
         "--cfg_vsd", "5.5",
+        "--sync_with_dataloader",
     ])
     assert args.condition_mode == "ab_focus"
     assert args.keep_a_composite is True
     assert args.lora_rank_unet == 4
+    assert args.sync_with_dataloader is True
 
 
 def test_parser_classification_helpers_reject_unclassified_dest():
@@ -211,3 +216,61 @@ def test_validate_resume_configuration_rejects_vsd_and_scheduler_fields():
             assert field in text
     finally:
         train_mod.RESUME_CONFIG_FIELDS = original
+
+
+def test_resume_configuration_tracks_sync_with_dataloader():
+    saved = {"sync_with_dataloader": True, "gradient_accumulation_steps": 4}
+    current = {"sync_with_dataloader": False, "gradient_accumulation_steps": 4}
+    import train_osediff_focus_fusion as train_mod
+    original = train_mod.RESUME_CONFIG_FIELDS
+    train_mod.RESUME_CONFIG_FIELDS = {"sync_with_dataloader", "gradient_accumulation_steps"}
+    try:
+        with pytest.raises(ValueError, match="sync_with_dataloader"):
+            validate_resume_configuration(saved_config=saved, current_config=current)
+    finally:
+        train_mod.RESUME_CONFIG_FIELDS = original
+
+
+def test_validate_sampler_resume_state_accepts_partial_accumulation():
+    state = {
+        "trainer_state_version": 4,
+        "dataset_length": 6,
+        "world_size": 1,
+        "train_batch_size": 1,
+        "gradient_accumulation_steps": 4,
+        "sync_with_dataloader": True,
+        "sampler_seed": 123,
+        "drop_last": False,
+        "current_epoch": 1,
+        "completed_epochs": 1,
+        "sampler_epoch": 1,
+        "batches_consumed_in_current_epoch": 0,
+        "global_step": 2,
+        "optimizer_updates": 2,
+        "scheduler_steps": 2,
+        "micro_batches": 6,
+    }
+    validate_sampler_resume_state(
+        state,
+        dataset_length=6,
+        world_size=1,
+        train_batch_size=1,
+        gradient_accumulation_steps=4,
+        sync_with_dataloader=True,
+        sampler_seed=123,
+        drop_last=False,
+        dataloader_length=6,
+    )
+    state["micro_batches"] = 1
+    with pytest.raises(ValueError, match="micro_batches"):
+        validate_sampler_resume_state(
+            state,
+            dataset_length=6,
+            world_size=1,
+            train_batch_size=1,
+            gradient_accumulation_steps=4,
+            sync_with_dataloader=True,
+            sampler_seed=123,
+            drop_last=False,
+            dataloader_length=6,
+        )

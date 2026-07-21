@@ -298,7 +298,7 @@ def load_verified_checkpoint(checkpoint_path):
     required_progress = (
         "global_step", "current_epoch", "completed_epochs", "batches_consumed_in_current_epoch",
         "micro_batches", "optimizer_updates", "scheduler_steps", "sampler_epoch",
-        "gradient_accumulation_steps",
+        "gradient_accumulation_steps", "sync_with_dataloader",
     )
     for field in required_progress:
         if field not in verified["trainer_state"]:
@@ -313,12 +313,15 @@ def load_verified_checkpoint(checkpoint_path):
         raise RuntimeError(
             f"[INVALID TRAINER STATE] scheduler_steps={trainer_state['scheduler_steps']} global_step={global_step}"
         )
-    expected_min_micro_batches = global_step * int(trainer_state["gradient_accumulation_steps"])
-    if int(trainer_state["micro_batches"]) < expected_min_micro_batches:
+    if int(trainer_state["micro_batches"]) < global_step:
         raise RuntimeError(
             "[INVALID TRAINER STATE] "
-            f"micro_batches={trainer_state['micro_batches']} expected_at_least={expected_min_micro_batches}"
+            f"micro_batches={trainer_state['micro_batches']} optimizer_updates={global_step}"
         )
+    if int(trainer_state.get("trainer_state_version", 3)) >= 4:
+        dataloader_length = trainer_state.get("dataloader_length")
+        if dataloader_length is not None and int(trainer_state["batches_consumed_in_current_epoch"]) == int(dataloader_length):
+            raise RuntimeError("[INVALID TRAINER STATE] version 4 checkpoints must store normalized epoch state")
     forbidden_progress = {
         "global_step", "current_epoch", "completed_epochs", "micro_batches",
         "optimizer_updates", "scheduler_steps", "batches_consumed_in_current_epoch",

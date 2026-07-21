@@ -97,6 +97,7 @@ def parse_args(argv=None):
     p.add_argument("--lambda_laplacian", type=float, default=.02)
     p.add_argument("--mixed_precision", choices=["no", "fp16", "bf16"], default="fp16")
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    p.add_argument("--sync_with_dataloader", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--resume_from_checkpoint")
     p.add_argument("--ram_path")
@@ -246,13 +247,6 @@ def validate_training_progress(progress: TrainingProgress, *, gradient_accumulat
         raise ValueError(f"[INVALID TRAINING PROGRESS] scheduler_steps={progress.scheduler_steps} global_step={progress.global_step}")
     if progress.micro_batches < progress.optimizer_updates:
         raise ValueError(f"[INVALID TRAINING PROGRESS] micro_batches={progress.micro_batches} optimizer_updates={progress.optimizer_updates}")
-    expected_min_micro_batches = progress.global_step * int(gradient_accumulation_steps)
-    if progress.micro_batches < expected_min_micro_batches:
-        raise ValueError(
-            "[INVALID TRAINING PROGRESS] "
-            f"micro_batches={progress.micro_batches} expected_at_least={expected_min_micro_batches} "
-            f"for global_step={progress.global_step} gradient_accumulation_steps={gradient_accumulation_steps}"
-        )
     if progress.completed_epochs > progress.current_epoch:
         raise ValueError(f"[INVALID TRAINING PROGRESS] completed_epochs={progress.completed_epochs} current_epoch={progress.current_epoch}")
     if progress.sampler_epoch != progress.current_epoch:
@@ -345,7 +339,7 @@ RESUME_CONFIG_FIELDS = {
     "vae_adapter_name", "vsd_adapter_name", "generator_target_modules", "vae_target_modules",
     "vsd_target_modules", "vae_scale_factor", "metadata_path", "dataset_base_path",
     "start_index", "max_samples", "dataset_length", "train_batch_size",
-    "gradient_accumulation_steps", "world_size", "seed", "sampler_seed", "drop_last",
+    "gradient_accumulation_steps", "sync_with_dataloader", "world_size", "seed", "sampler_seed", "drop_last",
     "random_flip", "mixed_precision", "learning_rate", "weight_decay", "lr_scheduler",
     "lr_warmup_steps", "lr_num_cycles", "lr_power", "max_grad_norm", "cfg_vsd",
     "keep_threshold", "keep_soft_width", "max_pixels", "native_resolution", "strict_native_size", "lambda_l2",
@@ -390,6 +384,7 @@ def build_resume_config_snapshot(args, *, model, accelerator, dataset_length):
         "dataset_length": int(dataset_length),
         "train_batch_size": int(args.train_batch_size),
         "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+        "sync_with_dataloader": bool(args.sync_with_dataloader),
         "world_size": int(accelerator.num_processes),
         "seed": int(args.seed),
         "sampler_seed": int(args.seed),
@@ -447,11 +442,13 @@ def validate_resume_configuration(*, saved_config, current_config, allowed_overr
 
 
 def validate_sampler_resume_state(trainer_state, *, dataset_length, world_size, train_batch_size,
-                                  gradient_accumulation_steps, sampler_seed, drop_last, dataloader_length=None):
+                                  gradient_accumulation_steps, sampler_seed, drop_last,
+                                  sync_with_dataloader=True, dataloader_length=None):
     if not trainer_state:
         return
-    if int(trainer_state.get("trainer_state_version", 3)) not in (2, 3):
-        _resume_mismatch("trainer_state_version", trainer_state.get("trainer_state_version"), "2 or 3")
+    version = int(trainer_state.get("trainer_state_version", 3))
+    if version not in (3, 4):
+        _resume_mismatch("trainer_state_version", trainer_state.get("trainer_state_version"), "3 or 4")
     checks = {
         "dataset_length": dataset_length,
         "world_size": world_size,
@@ -460,6 +457,8 @@ def validate_sampler_resume_state(trainer_state, *, dataset_length, world_size, 
         "sampler_seed": sampler_seed,
         "drop_last": drop_last,
     }
+    if version >= 4 or "sync_with_dataloader" in trainer_state:
+        checks["sync_with_dataloader"] = sync_with_dataloader
     for field, current in checks.items():
         if trainer_state.get(field) != current:
             _resume_mismatch(field, trainer_state.get(field), current)
@@ -473,6 +472,8 @@ def validate_sampler_resume_state(trainer_state, *, dataset_length, world_size, 
         _resume_mismatch("batches_consumed_in_current_epoch", batch_pos, ">=0")
     if dataloader_length is not None and batch_pos > dataloader_length:
         _resume_mismatch("batches_consumed_in_current_epoch", batch_pos, f"<= {dataloader_length}")
+    if version >= 4 and dataloader_length is not None and batch_pos == dataloader_length:
+        raise ValueError("[INVALID TRAINER STATE] version 4 checkpoints must store normalized epoch state")
     global_step = int(trainer_state.get("global_step", -1))
     if global_step < 0:
         _resume_mismatch("global_step", global_step, ">=0")
@@ -480,9 +481,8 @@ def validate_sampler_resume_state(trainer_state, *, dataset_length, world_size, 
         _resume_mismatch("optimizer_updates", trainer_state.get("optimizer_updates"), global_step)
     if int(trainer_state.get("scheduler_steps", global_step)) != global_step:
         _resume_mismatch("scheduler_steps", trainer_state.get("scheduler_steps"), global_step)
-    expected_min_micro_batches = global_step * int(gradient_accumulation_steps)
-    if int(trainer_state.get("micro_batches", global_step)) < expected_min_micro_batches:
-        _resume_mismatch("micro_batches", trainer_state.get("micro_batches"), f">= {expected_min_micro_batches}")
+    if int(trainer_state.get("micro_batches", global_step)) < global_step:
+        _resume_mismatch("micro_batches", trainer_state.get("micro_batches"), f">= {global_step}")
     if int(trainer_state.get("completed_epochs", 0)) > int(trainer_state.get("current_epoch", 0)):
         _resume_mismatch("completed_epochs", trainer_state.get("completed_epochs"), f"<= {trainer_state.get('current_epoch')}")
     print("[RESUME] sampler state validated")
@@ -515,7 +515,7 @@ def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, op
                       progress: TrainingProgress, gradient_accumulation_steps: int,
                       max_train_steps, checkpointing_steps=0,
                       validation_steps=0, compute_loss_fn=None, checkpoint_fn=None,
-                      validation_fn=None, logging_fn=None, logging_steps=10,
+                      validation_fn=None, logging_fn=None, event_callback=None, logging_steps=10,
                       max_grad_norm=None):
     """Shared optimizer-update loop used by formal training tests and main-like code."""
     optimizer.zero_grad(set_to_none=True)
@@ -533,6 +533,7 @@ def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, op
                     loss, losses = result
                 else:
                     loss, losses = result, {}
+                before_step = progress.global_step
                 progress.micro_batches += 1
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -544,6 +545,21 @@ def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, op
                     progress.global_step += 1
                     lr_scheduler.step()
                     progress.scheduler_steps += 1
+                    if event_callback:
+                        event_callback({
+                            "event": "optimizer_update",
+                            "global_step": progress.global_step,
+                            "micro_batches": progress.micro_batches,
+                        })
+                if event_callback:
+                    event_callback({
+                        "event": "micro_batch",
+                        "epoch": progress.current_epoch,
+                        "batch_index": batch_index,
+                        "sync_gradients": bool(accelerator.sync_gradients),
+                        "global_step_before": before_step,
+                        "global_step_after": progress.global_step,
+                    })
             progress.batches_consumed_in_current_epoch = batch_index + 1
             if accelerator.sync_gradients:
                 if logging_fn and (progress.global_step == 1 or (logging_steps and progress.global_step % logging_steps == 0)):
@@ -553,6 +569,11 @@ def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, op
                 if checkpointing_steps and progress.global_step % checkpointing_steps == 0 and checkpoint_fn:
                     checkpoint_fn(progress, losses)
             if progress.global_step >= max_train_steps:
+                if hasattr(train_dataloader, "__len__") and progress.batches_consumed_in_current_epoch == len(train_dataloader):
+                    progress.completed_epochs += 1
+                    progress.current_epoch += 1
+                    progress.sampler_epoch = progress.current_epoch
+                    progress.batches_consumed_in_current_epoch = 0
                 epoch_exhausted = False
                 break
         if epoch_exhausted:
@@ -704,7 +725,7 @@ def run_validation(model, loader, encode_fn, args, accelerator, step):
 
 def main(args):
     from accelerate import Accelerator
-    from accelerate.utils import set_seed
+    from accelerate.utils import GradientAccumulationPlugin, set_seed
     from diffusers import DDPMScheduler
     from diffusers.optimization import get_scheduler
     from transformers import AutoTokenizer, CLIPTextModel
@@ -723,7 +744,11 @@ def main(args):
     validate_resume_config(args, resume_cfg)
     if args.input_mode != "ab_focus" and (args.lambda_keep or args.lambda_bref):
         print(f"WARNING: keep-A and B-reference losses are disabled for input_mode={args.input_mode}; no fake masks will be created")
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, mixed_precision=args.mixed_precision)
+    accumulation_plugin = GradientAccumulationPlugin(
+        num_steps=args.gradient_accumulation_steps,
+        sync_with_dataloader=args.sync_with_dataloader,
+    )
+    accelerator = Accelerator(gradient_accumulation_plugin=accumulation_plugin, mixed_precision=args.mixed_precision)
     set_seed(args.seed); Path(args.output_dir, "checkpoints").mkdir(parents=True, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
@@ -829,6 +854,7 @@ def main(args):
             world_size=accelerator.num_processes,
             train_batch_size=args.train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
+            sync_with_dataloader=args.sync_with_dataloader,
             sampler_seed=args.seed,
             drop_last=False,
         )
@@ -843,11 +869,6 @@ def main(args):
         print("[RESUME] accelerator state restored")
     log_accelerator_resume_success(trainer_state=trainer_state)
     progress = TrainingProgress.from_trainer_state(trainer_state) if trainer_state else TrainingProgress()
-    if trainer_state and progress.batches_consumed_in_current_epoch == len(loader):
-        progress.completed_epochs += 1
-        progress.current_epoch += 1
-        progress.sampler_epoch = progress.current_epoch
-        progress.batches_consumed_in_current_epoch = 0
     validate_training_progress(progress, gradient_accumulation_steps=args.gradient_accumulation_steps, dataloader_length=len(loader))
 
     def compute_loss_callback(train_model, batch):
@@ -928,14 +949,16 @@ def main(args):
                 sampler_epoch=progress.current_epoch,
             )
             trainer_state = {
-                "trainer_state_version": 3,
+                "trainer_state_version": 4,
                 **progress.to_trainer_state_fields(),
                 "sampler_seed": args.seed,
                 "dataset_length": len(dataset),
+                "dataloader_length": len(loader),
                 "world_size": accelerator.num_processes,
                 "process_count": accelerator.num_processes,
                 "train_batch_size": args.train_batch_size,
                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "sync_with_dataloader": args.sync_with_dataloader,
                 "drop_last": False,
                 "resume_config": build_resume_config_snapshot(args, model=raw, accelerator=accelerator, dataset_length=len(dataset)),
             }

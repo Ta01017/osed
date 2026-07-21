@@ -52,6 +52,7 @@ def test_resume_metadata_rejects_world_size_or_dataset_length_change():
         "dataset_length": 32,
         "train_batch_size": 1,
         "gradient_accumulation_steps": 1,
+        "sync_with_dataloader": True,
         "sampler_seed": 123,
         "drop_last": False,
         "sampler_epoch": 0,
@@ -77,6 +78,7 @@ def test_validate_sampler_resume_state_rejects_batch_position_overflow():
         "dataset_length": 32,
         "train_batch_size": 1,
         "gradient_accumulation_steps": 1,
+        "sync_with_dataloader": True,
         "sampler_seed": 123,
         "drop_last": False,
         "sampler_epoch": 0,
@@ -90,11 +92,12 @@ def test_validate_sampler_resume_state_rejects_batch_position_overflow():
 
 def test_validate_sampler_resume_state_rejects_progress_counter_mismatches():
     saved = {
-        "trainer_state_version": 3,
+        "trainer_state_version": 4,
         "world_size": 1,
         "dataset_length": 32,
         "train_batch_size": 1,
         "gradient_accumulation_steps": 1,
+        "sync_with_dataloader": True,
         "sampler_seed": 123,
         "drop_last": False,
         "current_epoch": 0,
@@ -119,3 +122,68 @@ def test_validate_sampler_resume_state_rejects_progress_counter_mismatches():
     with pytest.raises(ValueError, match="micro_batches"):
         validate_sampler_resume_state(saved, dataset_length=32, world_size=1, train_batch_size=1,
                                       gradient_accumulation_steps=1, sampler_seed=123, drop_last=False)
+
+
+def test_validate_sampler_resume_state_accepts_epoch_length_six_partial_accumulation():
+    saved = {
+        "trainer_state_version": 4,
+        "world_size": 1,
+        "dataset_length": 6,
+        "train_batch_size": 1,
+        "gradient_accumulation_steps": 4,
+        "sync_with_dataloader": True,
+        "sampler_seed": 123,
+        "drop_last": False,
+        "current_epoch": 1,
+        "sampler_epoch": 1,
+        "completed_epochs": 1,
+        "batches_consumed_in_current_epoch": 0,
+        "global_step": 2,
+        "optimizer_updates": 2,
+        "scheduler_steps": 2,
+        "micro_batches": 6,
+    }
+    validate_sampler_resume_state(
+        saved,
+        dataset_length=6,
+        world_size=1,
+        train_batch_size=1,
+        gradient_accumulation_steps=4,
+        sync_with_dataloader=True,
+        sampler_seed=123,
+        drop_last=False,
+        dataloader_length=6,
+    )
+
+
+def test_validate_sampler_resume_state_rejects_version4_epoch_tail_position():
+    saved = {
+        "trainer_state_version": 4,
+        "world_size": 1,
+        "dataset_length": 6,
+        "train_batch_size": 1,
+        "gradient_accumulation_steps": 4,
+        "sync_with_dataloader": True,
+        "sampler_seed": 123,
+        "drop_last": False,
+        "current_epoch": 0,
+        "sampler_epoch": 0,
+        "completed_epochs": 0,
+        "batches_consumed_in_current_epoch": 6,
+        "global_step": 2,
+        "optimizer_updates": 2,
+        "scheduler_steps": 2,
+        "micro_batches": 6,
+    }
+    with pytest.raises(ValueError, match="version 4"):
+        validate_sampler_resume_state(
+            saved,
+            dataset_length=6,
+            world_size=1,
+            train_batch_size=1,
+            gradient_accumulation_steps=4,
+            sync_with_dataloader=True,
+            sampler_seed=123,
+            drop_last=False,
+            dataloader_length=6,
+        )

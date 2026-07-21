@@ -2,6 +2,8 @@
 set -euo pipefail
 GPU="${GPU:-0}"; INPUT_MODE="${INPUT_MODE:-ab_focus}"; MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
 TRAIN_VAE_LORA="${TRAIN_VAE_LORA:-0}"; USE_VSD="${USE_VSD:-0}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
+RUN_PARTIAL_EPOCH_TEST="${RUN_PARTIAL_EPOCH_TEST:-0}"
 LORA_RANK_UNET="${LORA_RANK_UNET:-8}"; LORA_RANK_VAE="${LORA_RANK_VAE:-4}"; LORA_RANK_VSD="${LORA_RANK_VSD:-8}"
 METADATA="${METADATA:-/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/dataset/focus_merged_6000_dedup_0710_v3/train/metadata_with_homography_warped_focus_ckptA.json}"
 DATASET_BASE="${DATASET_BASE:-/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/dataset/focus_merged_6000_dedup_0710_v3/train}"
@@ -15,7 +17,7 @@ LOG1="$OUTPUT_DIR/resume_step1.log"; LOG2="$OUTPUT_DIR/resume_step2.log"; LOG3="
 set +e
 CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
  --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
- --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps 1 \
+ --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" --sync_with_dataloader \
  --lora_rank_unet "$LORA_RANK_UNET" --lora_rank_vae "$LORA_RANK_VAE" --lora_rank_vsd "$LORA_RANK_VSD" \
  --max_samples 16 --max_train_steps 1 --checkpointing_steps 1 --validation_steps 1 --validation_max_samples 1 \
  --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" 2>&1 | tee "$LOG1"
@@ -34,6 +36,7 @@ for key in ("model_state","trainer_state","optimizer_manifest"):
 state = torch.load(ckpt/"model_state.pt", map_location="cpu")
 trainer = json.loads((ckpt/"trainer_state.json").read_text())
 assert trainer["global_step"] == trainer["optimizer_updates"] == trainer["scheduler_steps"] == 1
+assert trainer["micro_batches"] == int(1 * int(trainer["gradient_accumulation_steps"]))
 checks = {}
 for name in ("generator_unet_lora","vae_lora","vsd_unet_lora"):
     tensors = state.get(name, {})
@@ -44,7 +47,7 @@ PY
 set +e
 CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
  --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
- --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps 1 \
+ --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" --sync_with_dataloader \
  --lora_rank_unet "$LORA_RANK_UNET" --lora_rank_vae "$LORA_RANK_VAE" --lora_rank_vsd "$LORA_RANK_VSD" \
  --max_samples 16 --max_train_steps 2 --checkpointing_steps 1 --validation_steps 1 --validation_max_samples 1 \
  --resume_from_checkpoint "$CHECKPOINT" --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" 2>&1 | tee "$LOG2"
@@ -67,12 +70,13 @@ for key in ("model_state","trainer_state","optimizer_manifest"):
     assert compute_file_sha256(p) == m[key]["sha256"]
 trainer = json.loads((ckpt2/"trainer_state.json").read_text())
 assert trainer["global_step"] == trainer["optimizer_updates"] == trainer["scheduler_steps"] == 2
+assert trainer["micro_batches"] == int(2 * int(trainer["gradient_accumulation_steps"]))
 PY
 CHECKPOINT="$OUTPUT_DIR/checkpoints/checkpoint-00000002"
 set +e
 CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
  --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
- --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps 1 \
+ --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" --sync_with_dataloader \
  --lora_rank_unet "$LORA_RANK_UNET" --lora_rank_vae "$LORA_RANK_VAE" --lora_rank_vsd "$LORA_RANK_VSD" \
  --max_samples 16 --max_train_steps 3 --checkpointing_steps 1 --validation_steps 1 --validation_max_samples 1 \
  --resume_from_checkpoint "$CHECKPOINT" --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" 2>&1 | tee "$LOG3"
@@ -87,6 +91,7 @@ for log_path in map(Path, sys.argv[2:]):
     for needle in ("checkpoint verified", "resume config validated", "sampler state validated", "optimizer manifest validated", "accelerator state restored", "trainer state restored"):
         assert needle in text, (log_path, needle)
 states = []
+assert (out/"checkpoints"/"checkpoint-00000003").is_dir()
 for step in (1, 2, 3):
     ckpt = out/"checkpoints"/f"checkpoint-{step:08d}"
     m = json.loads((ckpt/"checkpoint_complete.json").read_text())
@@ -97,7 +102,35 @@ for step in (1, 2, 3):
         assert compute_file_sha256(p) == m[key]["sha256"]
     trainer = json.loads((ckpt/"trainer_state.json").read_text())
     assert trainer["global_step"] == trainer["optimizer_updates"] == trainer["scheduler_steps"] == step
+    assert trainer["sync_with_dataloader"] is True
+    assert trainer["micro_batches"] == step * int(trainer["gradient_accumulation_steps"])
     states.append(trainer)
 assert states[0]["micro_batches"] < states[1]["micro_batches"] < states[2]["micro_batches"]
 print("[RESUME SMOKE PASS]")
 PY
+
+if [[ "$RUN_PARTIAL_EPOCH_TEST" == "1" ]]; then
+  PARTIAL_DIR="${OUTPUT_DIR}_partial_epoch"
+  PARTIAL_LOG="$PARTIAL_DIR/partial_epoch.log"
+  mkdir -p "$PARTIAL_DIR"
+  set +e
+  CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
+   --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$PARTIAL_DIR" \
+   --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps 4 --sync_with_dataloader \
+   --lora_rank_unet "$LORA_RANK_UNET" --lora_rank_vae "$LORA_RANK_VAE" --lora_rank_vsd "$LORA_RANK_VSD" \
+   --max_samples 6 --max_train_steps 2 --checkpointing_steps 1 --validation_steps 0 --validation_max_samples 1 \
+   --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" 2>&1 | tee "$PARTIAL_LOG"
+  code=${PIPESTATUS[0]}; set -e; [[ "$code" == "0" ]] || { echo "[SMOKE FAIL] partial epoch command failed: $code" >&2; exit "$code"; }
+  python - "$PARTIAL_DIR" <<'PY'
+import json, sys
+from pathlib import Path
+out = Path(sys.argv[1])
+ckpt = out / "checkpoints" / "checkpoint-00000002"
+trainer = json.loads((ckpt / "trainer_state.json").read_text())
+assert trainer["global_step"] == trainer["optimizer_updates"] == trainer["scheduler_steps"]
+assert trainer["micro_batches"] >= trainer["optimizer_updates"]
+assert trainer["gradient_accumulation_steps"] == 4
+assert trainer["sync_with_dataloader"] is True
+print("[PARTIAL EPOCH SMOKE PASS]")
+PY
+fi

@@ -84,7 +84,7 @@ def _args(**kw):
 
 def _trainer_state(step=1, accumulation=1, **kw):
     base = {
-        "trainer_state_version": 3,
+        "trainer_state_version": 4,
         "global_step": step,
         "current_epoch": 0,
         "completed_epochs": 0,
@@ -94,6 +94,8 @@ def _trainer_state(step=1, accumulation=1, **kw):
         "scheduler_steps": step,
         "sampler_epoch": 0,
         "gradient_accumulation_steps": accumulation,
+        "sync_with_dataloader": True,
+        "dataloader_length": 32,
     }
     base.update(kw)
     return base
@@ -239,13 +241,61 @@ def test_verified_checkpoint_rejects_corrupt_trainer_progress(tmp_path):
     (temp_dir / "accelerator_state").mkdir()
     write_json_atomically(temp_dir / "accelerator_state" / "rank0.json", {"ok": True})
     payload = checkpoint_payload(TinyModel(), 1, _args())
-    trainer = _trainer_state(1, accumulation=4, micro_batches=3)
+    trainer = _trainer_state(2, accumulation=4, micro_batches=1, optimizer_updates=2, scheduler_steps=2)
     optim = []
     torch.save(payload, temp_dir / "model_state.pt")
     write_json_atomically(temp_dir / "trainer_state.json", trainer)
     write_json_atomically(temp_dir / "optimizer_manifest.json", optim)
     finalize_checkpoint_directory(temp_dir, final_dir, payload, trainer, optim)
     with pytest.raises(RuntimeError, match="INVALID TRAINER STATE"):
+        load_verified_checkpoint(final_dir)
+
+
+def test_verified_checkpoint_accepts_partial_epoch_accumulation(tmp_path):
+    final_dir = tmp_path / "checkpoint-00000002"
+    temp_dir = prepare_checkpoint_temp_dir(final_dir)
+    (temp_dir / "accelerator_state").mkdir()
+    write_json_atomically(temp_dir / "accelerator_state" / "rank0.json", {"ok": True})
+    payload = checkpoint_payload(TinyModel(), 2, _args())
+    trainer = _trainer_state(
+        2,
+        accumulation=4,
+        micro_batches=6,
+        batches_consumed_in_current_epoch=0,
+        current_epoch=1,
+        completed_epochs=1,
+        sampler_epoch=1,
+        dataloader_length=6,
+    )
+    optim = []
+    torch.save(payload, temp_dir / "model_state.pt")
+    write_json_atomically(temp_dir / "trainer_state.json", trainer)
+    write_json_atomically(temp_dir / "optimizer_manifest.json", optim)
+    finalize_checkpoint_directory(temp_dir, final_dir, payload, trainer, optim)
+    verified = load_verified_checkpoint(final_dir)
+    assert verified["trainer_state"]["micro_batches"] == 6
+    assert verified["trainer_state"]["global_step"] == 2
+
+
+def test_verified_checkpoint_rejects_version4_unnormalized_epoch_state(tmp_path):
+    final_dir = tmp_path / "checkpoint-00000002"
+    temp_dir = prepare_checkpoint_temp_dir(final_dir)
+    (temp_dir / "accelerator_state").mkdir()
+    write_json_atomically(temp_dir / "accelerator_state" / "rank0.json", {"ok": True})
+    payload = checkpoint_payload(TinyModel(), 2, _args())
+    trainer = _trainer_state(
+        2,
+        accumulation=4,
+        micro_batches=6,
+        batches_consumed_in_current_epoch=6,
+        dataloader_length=6,
+    )
+    optim = []
+    torch.save(payload, temp_dir / "model_state.pt")
+    write_json_atomically(temp_dir / "trainer_state.json", trainer)
+    write_json_atomically(temp_dir / "optimizer_manifest.json", optim)
+    finalize_checkpoint_directory(temp_dir, final_dir, payload, trainer, optim)
+    with pytest.raises(RuntimeError, match="version 4"):
         load_verified_checkpoint(final_dir)
 
 

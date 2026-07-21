@@ -10,6 +10,7 @@ from osediff_focus_fusion import (
     encode_rgb_conditions,
     expand_unet_conv_in,
     tiled_unet_forward,
+    normalize_input_mode,
 )
 
 
@@ -50,6 +51,8 @@ class DummyVAE:
 
 def test_input_mode_channels():
     assert INPUT_MODE_TO_CHANNELS == {"single": 4, "dual": 8, "ab_focus": 10, "quad_rgb": 16}
+    assert normalize_input_mode("ab") == "dual"
+    assert normalize_input_mode("four") == "quad_rgb"
 
 
 def test_conv_in_expand_rules():

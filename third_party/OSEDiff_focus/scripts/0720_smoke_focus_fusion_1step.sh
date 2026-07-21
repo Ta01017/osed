@@ -13,7 +13,7 @@ mkdir -p "$OUTPUT_DIR"
 set +e
 CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
  --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
- --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd 0 --train_batch_size 1 --gradient_accumulation_steps 1 \
+ --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd 0 --train_batch_size 1 --gradient_accumulation_steps 1 --sync_with_dataloader \
  --lora_rank_unet "$LORA_RANK_UNET" --lora_rank_vae "$LORA_RANK_VAE" --lora_rank_vsd "$LORA_RANK_VSD" \
  --max_samples 16 --max_train_steps 1 --checkpointing_steps 1 --validation_steps 1 --validation_max_samples 1 \
  --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" 2>&1 | tee "$LOG"
@@ -44,6 +44,7 @@ for key in ("model_state", "trainer_state", "optimizer_manifest"):
     assert compute_file_sha256(p) == m[key]["sha256"]
 trainer = json.loads((ckpt / "trainer_state.json").read_text())
 assert trainer["global_step"] == 1
+assert trainer["sync_with_dataloader"] is True
 assert m["generator_in_channels"] in (4, 8, 10, 16)
 val = out / "validation" / "global_step_000001"
 assert val.is_dir(), val

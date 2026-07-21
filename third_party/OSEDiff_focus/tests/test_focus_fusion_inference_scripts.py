@@ -58,4 +58,7 @@ def test_smoke_shells_have_automatic_checks_and_independent_ranks():
     assert "LORA_RANK_VSD" in resume
     assert "TRAIN_VAE_LORA" in resume
     assert "USE_VSD" in resume
-    assert "[SMOKE PASS]" in resume
+    assert "[RESUME SMOKE PASS]" in resume
+    assert "checkpoint-00000003" in resume
+    assert "RUN_PARTIAL_EPOCH_TEST" in resume
+    assert "--sync_with_dataloader" in resume
