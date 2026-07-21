@@ -146,6 +146,64 @@ def validate_optimizer_manifest(saved, current):
             raise RuntimeError(f"optimizer group parameter shapes mismatch for {new['name']}")
 
 
+RESUME_ALLOWED_CLI_OVERRIDES = {"max_train_steps", "validation_steps", "checkpointing_steps", "output_dir"}
+
+
+def validate_resume_config(args, resume_cfg):
+    """Validate structural resume fields and copy checkpoint-owned structure onto args."""
+    if not resume_cfg:
+        return args
+    print("[RESUME] allowed CLI overrides:", sorted(RESUME_ALLOWED_CLI_OVERRIDES))
+    structural = {
+        "input_mode": normalize_input_mode(getattr(args, "condition_mode", None) or args.input_mode),
+        "generator_lora_rank": args.lora_rank_unet,
+        "train_conv_in": args.train_conv_in,
+        "train_vae_lora": args.train_vae_lora,
+        "use_vsd": bool(args.use_vsd),
+        "prompt_mode": args.prompt_mode,
+    }
+    for name, cli_value in structural.items():
+        ckpt_value = resume_cfg[name]
+        if cli_value != ckpt_value:
+            raise RuntimeError(f"resume structural parameter conflict: {name}: checkpoint={ckpt_value} CLI={cli_value}")
+    args.input_mode = resume_cfg["input_mode"]
+    args.lora_rank_unet = resume_cfg["generator_lora_rank"]
+    args.train_conv_in = resume_cfg["train_conv_in"]
+    args.train_vae_lora = resume_cfg["train_vae_lora"]
+    args.use_vsd = int(resume_cfg["use_vsd"])
+    args.prompt_mode = resume_cfg["prompt_mode"]
+    return args
+
+
+def resume_training_from_checkpoint(*, resume_state, optimizer, lr_scheduler, accelerator, optimizer_manifest):
+    """Restore optimizer/scheduler/scaler/RNG/progress after accelerator.prepare."""
+    if not resume_state:
+        return {"global_step": 0, "completed_epochs": 0, "micro_steps_in_current_epoch": 0}
+    validate_optimizer_manifest(resume_state.get("optimizer_group_manifest"), optimizer_manifest)
+    if resume_state.get("optimizer"):
+        optimizer.load_state_dict(resume_state["optimizer"])
+        print("[RESUME] optimizer restored")
+    if resume_state.get("lr_scheduler"):
+        lr_scheduler.load_state_dict(resume_state["lr_scheduler"])
+        print("[RESUME] scheduler restored")
+    scaler = getattr(accelerator, "scaler", None)
+    if scaler is not None and resume_state.get("scaler_state"):
+        scaler.load_state_dict(resume_state["scaler_state"])
+        print("[RESUME] scaler restored")
+    if restore_rng_state(resume_state.get("rng_state")):
+        print("[RESUME] RNG restored")
+    progress = {
+        "global_step": int(resume_state.get("global_step", resume_state.get("training_step", 0))),
+        "completed_epochs": int(resume_state.get("completed_epochs", 0)),
+        "micro_steps_in_current_epoch": int(resume_state.get("micro_steps_in_current_epoch", resume_state.get("dataloader_position", 0))),
+    }
+    print(f"[RESUME] checkpoint global_step {progress['global_step']}")
+    print(f"[RESUME] completed_epochs {progress['completed_epochs']}")
+    print(f"[RESUME] micro_steps_in_current_epoch {progress['micro_steps_in_current_epoch']}")
+    print(f"[RESUME] dataloader batches skipped {progress['micro_steps_in_current_epoch']}")
+    return progress
+
+
 def _groups(model, args, vsd=None):
     groups = []
     named = _named_params(model.unet, lambda n, p: "lora" in n and p.requires_grad, "unet.")
@@ -299,27 +357,7 @@ def main(args):
         args.lora_rank = args.lora_rank_unet
     args.input_mode = normalize_input_mode(args.condition_mode or args.input_mode)
     resume_cfg = read_focus_checkpoint_config(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
-    if resume_cfg:
-        allowed_overrides = {"max_train_steps", "validation_steps", "checkpointing_steps", "output_dir"}
-        print("[RESUME] allowed CLI overrides:", sorted(allowed_overrides))
-        structural = {
-            "input_mode": args.input_mode,
-            "generator_lora_rank": args.lora_rank_unet,
-            "train_conv_in": args.train_conv_in,
-            "train_vae_lora": args.train_vae_lora,
-            "use_vsd": bool(args.use_vsd),
-            "prompt_mode": args.prompt_mode,
-        }
-        for name, cli_value in structural.items():
-            ckpt_value = resume_cfg[name]
-            if cli_value != ckpt_value:
-                raise RuntimeError(f"resume structural parameter conflict: {name}: checkpoint={ckpt_value} CLI={cli_value}")
-        args.input_mode = resume_cfg["input_mode"]
-        args.lora_rank_unet = resume_cfg["generator_lora_rank"]
-        args.train_conv_in = resume_cfg["train_conv_in"]
-        args.train_vae_lora = resume_cfg["train_vae_lora"]
-        args.use_vsd = int(resume_cfg["use_vsd"])
-        args.prompt_mode = resume_cfg["prompt_mode"]
+    validate_resume_config(args, resume_cfg)
     if args.input_mode != "ab_focus" and (args.lambda_keep or args.lambda_bref):
         print(f"WARNING: keep-A and B-reference losses are disabled for input_mode={args.input_mode}; no fake masks will be created")
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, mixed_precision=args.mixed_precision)
@@ -406,31 +444,20 @@ def main(args):
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles, power=args.lr_power)
-    start = int(resume_state.get("global_step", resume_state.get("training_step", 0))) if resume_state else 0
-    completed_epochs = int(resume_state.get("completed_epochs", 0)) if resume_state else 0
-    resume_micro_steps = int(resume_state.get("micro_steps_in_current_epoch", resume_state.get("dataloader_position", 0))) if resume_state else 0
     if model_reg is None:
         model, text_encoder, optimizer, loader, lr_scheduler = accelerator.prepare(model, text_encoder, optimizer, loader, lr_scheduler)
     else:
         model, model_reg, text_encoder, optimizer, loader, lr_scheduler = accelerator.prepare(model, model_reg, text_encoder, optimizer, loader, lr_scheduler)
-    if resume_state:
-        validate_optimizer_manifest(resume_state.get("optimizer_group_manifest"), current_manifest)
-        if resume_state.get("optimizer"):
-            optimizer.load_state_dict(resume_state["optimizer"])
-            print("[RESUME] optimizer restored")
-        if resume_state.get("lr_scheduler"):
-            lr_scheduler.load_state_dict(resume_state["lr_scheduler"])
-            print("[RESUME] scheduler restored")
-        scaler = getattr(accelerator, "scaler", None)
-        if scaler is not None and resume_state.get("scaler_state"):
-            scaler.load_state_dict(resume_state["scaler_state"])
-            print("[RESUME] scaler restored")
-        if restore_rng_state(resume_state.get("rng_state")):
-            print("[RESUME] RNG restored")
-        print(f"[RESUME] checkpoint global_step {start}")
-        print(f"[RESUME] completed_epochs {completed_epochs}")
-        print(f"[RESUME] micro_steps_in_current_epoch {resume_micro_steps}")
-        print(f"[RESUME] dataloader batches skipped {resume_micro_steps}")
+    resume_progress = resume_training_from_checkpoint(
+        resume_state=resume_state,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        accelerator=accelerator,
+        optimizer_manifest=current_manifest,
+    )
+    start = resume_progress["global_step"]
+    completed_epochs = resume_progress["completed_epochs"]
+    resume_micro_steps = resume_progress["micro_steps_in_current_epoch"]
     global_step = int(start)
     optimizer.zero_grad(set_to_none=True)
     while global_step < args.max_train_steps:
