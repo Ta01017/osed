@@ -22,6 +22,26 @@ from osediff_focus_fusion import (FocusFusionGenerator, checkpoint_payload, grad
                                   write_json_atomically, load_verified_checkpoint)
 
 
+def get_parser_argument_dests(parser):
+    return {a.dest for a in parser._actions if a.dest != "help"}
+
+
+def assert_cli_argument_classification(parser):
+    groups = [RESUME_CONFIG_FIELDS, RESUME_OVERRIDE_FIELDS, NON_TRAINING_FIELDS, DEPRECATED_ALIAS_FIELDS, RUNTIME_DERIVED_FIELDS]
+    seen = {}
+    duplicates = set()
+    for group in groups:
+        for item in group:
+            if item in seen:
+                duplicates.add(item)
+            seen[item] = True
+    if duplicates:
+        raise RuntimeError("duplicate CLI argument classification: " + ", ".join(sorted(duplicates)))
+    unclassified = get_parser_argument_dests(parser) - set(seen)
+    if unclassified:
+        raise RuntimeError("unclassified CLI arguments: " + ", ".join(sorted(unclassified)))
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--pretrained_model_name_or_path", required=True)
@@ -81,7 +101,11 @@ def parse_args(argv=None):
     p.add_argument("--resume_from_checkpoint")
     p.add_argument("--ram_path")
     p.add_argument("--ram_ft_path")
-    return p.parse_args(argv)
+    assert_cli_argument_classification(p)
+    args = p.parse_args(argv)
+    if args.lora_rank is not None:
+        raise ValueError("--lora_rank is deprecated and no longer accepted. Use --lora_rank_unet, --lora_rank_vae and --lora_rank_vsd explicitly.")
+    return args
 
 
 def _add_generator_lora(unet, rank, targets=None, adapter_name="focus_fusion"):
@@ -180,7 +204,12 @@ class TrainingProgress:
     @classmethod
     def from_trainer_state(cls, trainer_state):
         if not trainer_state:
-            return cls()
+            raise ValueError("[INVALID TRAINER STATE] missing trainer_state")
+        required = ("global_step", "current_epoch", "completed_epochs", "batches_consumed_in_current_epoch",
+                    "micro_batches", "optimizer_updates", "scheduler_steps", "sampler_epoch")
+        for field in required:
+            if field not in trainer_state:
+                raise ValueError(f"[INVALID TRAINER STATE] missing required progress field: {field}")
         return cls(
             global_step=int(trainer_state["global_step"]),
             current_epoch=int(trainer_state.get("current_epoch", 0)),
@@ -217,6 +246,13 @@ def validate_training_progress(progress: TrainingProgress, *, gradient_accumulat
         raise ValueError(f"[INVALID TRAINING PROGRESS] scheduler_steps={progress.scheduler_steps} global_step={progress.global_step}")
     if progress.micro_batches < progress.optimizer_updates:
         raise ValueError(f"[INVALID TRAINING PROGRESS] micro_batches={progress.micro_batches} optimizer_updates={progress.optimizer_updates}")
+    expected_min_micro_batches = progress.global_step * int(gradient_accumulation_steps)
+    if progress.micro_batches < expected_min_micro_batches:
+        raise ValueError(
+            "[INVALID TRAINING PROGRESS] "
+            f"micro_batches={progress.micro_batches} expected_at_least={expected_min_micro_batches} "
+            f"for global_step={progress.global_step} gradient_accumulation_steps={gradient_accumulation_steps}"
+        )
     if progress.completed_epochs > progress.current_epoch:
         raise ValueError(f"[INVALID TRAINING PROGRESS] completed_epochs={progress.completed_epochs} current_epoch={progress.current_epoch}")
     if progress.sampler_epoch != progress.current_epoch:
@@ -255,30 +291,19 @@ def validate_resume_config(args, resume_cfg):
     return args
 
 
-def resume_training_from_checkpoint(*, trainer_state, optimizer=None, lr_scheduler=None, accelerator=None, optimizer_manifest=None):
-    """Restore only trainer progress; optimizer/scheduler/scaler/RNG are restored by Accelerate."""
+def log_accelerator_resume_success(*, trainer_state):
+    """Log resume success; training progress is owned by TrainingProgress.from_trainer_state."""
     if not trainer_state:
-        return {"global_step": 0, "completed_epochs": 0, "micro_steps_in_current_epoch": 0}
-    if optimizer_manifest is not None and trainer_state.get("optimizer_group_manifest") is not None:
-        validate_optimizer_manifest(trainer_state["optimizer_group_manifest"], optimizer_manifest)
+        return
     print("[RESUME] optimizer restored by Accelerate")
     print("[RESUME] scheduler restored by Accelerate")
     print("[RESUME] scaler restored by Accelerate")
     print("[RESUME] rank RNG restored by Accelerate")
-    progress = {
-        "global_step": int(trainer_state["global_step"]),
-        "completed_epochs": int(trainer_state.get("completed_epochs", trainer_state.get("current_epoch", 0))),
-        "micro_steps_in_current_epoch": int(trainer_state["batches_consumed_in_current_epoch"]),
-    }
-    progress["current_epoch"] = progress["completed_epochs"]
-    progress["batches_consumed_in_current_epoch"] = progress["micro_steps_in_current_epoch"]
-    print(f"[RESUME] checkpoint global_step {progress['global_step']}")
-    print(f"[RESUME] completed_epochs {progress['completed_epochs']}")
-    print(f"[RESUME] micro_steps_in_current_epoch {progress['micro_steps_in_current_epoch']}")
-    print(f"[RESUME] dataloader batches skipped {progress['micro_steps_in_current_epoch']}")
+    print(f"[RESUME] checkpoint global_step {int(trainer_state['global_step'])}")
+    print(f"[RESUME] completed_epochs {int(trainer_state['completed_epochs'])}")
+    print(f"[RESUME] batches consumed in current epoch {int(trainer_state['batches_consumed_in_current_epoch'])}")
     print("[RESUME] sampler position restored")
     print("[RESUME] trainer state restored")
-    return progress
 
 
 def build_train_sampler(dataset, accelerator, args, epoch=0):
@@ -329,7 +354,12 @@ RESUME_CONFIG_FIELDS = {
 }
 RESUME_OVERRIDE_FIELDS = {"max_train_steps", "checkpointing_steps", "validation_steps", "validation_max_samples", "logging_steps", "output_dir"}
 RESUME_INVARIANT_FIELDS = RESUME_CONFIG_FIELDS
-NON_TRAINING_FIELDS = {"resume_from_checkpoint", "ram_path", "ram_ft_path", "smoke", "resolution", "random_crop", "center_crop", "dataloader_num_workers", "lora_rank"}
+NON_TRAINING_FIELDS = {
+    "resume_from_checkpoint", "ram_path", "ram_ft_path", "smoke", "resolution",
+    "random_crop", "center_crop", "dataloader_num_workers", "keep_a_composite",
+}
+DEPRECATED_ALIAS_FIELDS = {"condition_mode", "lora_rank"}
+RUNTIME_DERIVED_FIELDS = set()
 
 
 def build_resume_config_snapshot(args, *, model, accelerator, dataset_length):
@@ -450,8 +480,9 @@ def validate_sampler_resume_state(trainer_state, *, dataset_length, world_size, 
         _resume_mismatch("optimizer_updates", trainer_state.get("optimizer_updates"), global_step)
     if int(trainer_state.get("scheduler_steps", global_step)) != global_step:
         _resume_mismatch("scheduler_steps", trainer_state.get("scheduler_steps"), global_step)
-    if int(trainer_state.get("micro_batches", global_step)) < global_step:
-        _resume_mismatch("micro_batches", trainer_state.get("micro_batches"), f">= {global_step}")
+    expected_min_micro_batches = global_step * int(gradient_accumulation_steps)
+    if int(trainer_state.get("micro_batches", global_step)) < expected_min_micro_batches:
+        _resume_mismatch("micro_batches", trainer_state.get("micro_batches"), f">= {expected_min_micro_batches}")
     if int(trainer_state.get("completed_epochs", 0)) > int(trainer_state.get("current_epoch", 0)):
         _resume_mismatch("completed_epochs", trainer_state.get("completed_epochs"), f"<= {trainer_state.get('current_epoch')}")
     print("[RESUME] sampler state validated")
@@ -481,13 +512,14 @@ def broadcast_checkpoint_temp_dir(accelerator, temp_dir_on_main, final_dir):
 
 
 def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, optimizer, lr_scheduler,
-                      progress: TrainingProgress, max_train_steps, checkpointing_steps=0,
+                      progress: TrainingProgress, gradient_accumulation_steps: int,
+                      max_train_steps, checkpointing_steps=0,
                       validation_steps=0, compute_loss_fn=None, checkpoint_fn=None,
                       validation_fn=None, logging_fn=None, logging_steps=10,
                       max_grad_norm=None):
     """Shared optimizer-update loop used by formal training tests and main-like code."""
     optimizer.zero_grad(set_to_none=True)
-    validate_training_progress(progress, gradient_accumulation_steps=getattr(accelerator, "accumulation", 1), dataloader_length=len(train_dataloader) if hasattr(train_dataloader, "__len__") else None)
+    validate_training_progress(progress, gradient_accumulation_steps=gradient_accumulation_steps, dataloader_length=len(train_dataloader) if hasattr(train_dataloader, "__len__") else None)
     while progress.global_step < max_train_steps:
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(progress.sampler_epoch)
@@ -528,7 +560,7 @@ def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, op
             progress.current_epoch += 1
             progress.sampler_epoch = progress.current_epoch
             progress.batches_consumed_in_current_epoch = 0
-    validate_training_progress(progress, gradient_accumulation_steps=getattr(accelerator, "accumulation", 1), dataloader_length=len(train_dataloader) if hasattr(train_dataloader, "__len__") else None)
+    validate_training_progress(progress, gradient_accumulation_steps=gradient_accumulation_steps, dataloader_length=len(train_dataloader) if hasattr(train_dataloader, "__len__") else None)
     return progress
 
 
@@ -681,8 +713,6 @@ def main(args):
     from osediff import OSEDiff_reg
     from osediff_focus_fusion import expand_unet_conv_in
 
-    if args.lora_rank is not None:
-        raise ValueError("--lora_rank is deprecated and no longer accepted. Use --lora_rank_unet, --lora_rank_vae and --lora_rank_vsd explicitly.")
     args.input_mode = normalize_input_mode(args.condition_mode or args.input_mode)
     verified_resume = load_verified_checkpoint(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
     trainer_state = verified_resume["trainer_state"] if verified_resume else None
@@ -811,17 +841,15 @@ def main(args):
     if verified_resume:
         accelerator.load_state(str(Path(verified_resume["checkpoint_dir"], "accelerator_state")))
         print("[RESUME] accelerator state restored")
-    resume_training_from_checkpoint(trainer_state=trainer_state, accelerator=accelerator, optimizer_manifest=current_manifest)
-    progress = TrainingProgress.from_trainer_state(trainer_state)
+    log_accelerator_resume_success(trainer_state=trainer_state)
+    progress = TrainingProgress.from_trainer_state(trainer_state) if trainer_state else TrainingProgress()
     if trainer_state and progress.batches_consumed_in_current_epoch == len(loader):
         progress.completed_epochs += 1
         progress.current_epoch += 1
         progress.sampler_epoch = progress.current_epoch
         progress.batches_consumed_in_current_epoch = 0
     validate_training_progress(progress, gradient_accumulation_steps=args.gradient_accumulation_steps, dataloader_length=len(loader))
-    start = resume_progress["global_step"]
-    completed_epochs = resume_progress["completed_epochs"]
-    resume_micro_steps = resume_progress["micro_steps_in_current_epoch"]
+
     def compute_loss_callback(train_model, batch):
         prompts = batch["prompt"]
         if args.prompt_mode == "ram":
@@ -895,7 +923,7 @@ def main(args):
                 raw, progress.global_step, args, None, None, raw_reg, accelerator,
                 optimizer_group_manifest=current_manifest,
                 completed_epochs=progress.current_epoch,
-                micro_steps_in_current_epoch=progress.batches_consumed_in_current_epoch,
+                batch_position=progress.batches_consumed_in_current_epoch,
                 dataloader_position=progress.batches_consumed_in_current_epoch,
                 sampler_epoch=progress.current_epoch,
             )
@@ -926,6 +954,7 @@ def main(args):
         lr_scheduler=lr_scheduler,
         max_train_steps=args.max_train_steps,
         progress=progress,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         compute_loss_fn=compute_loss_callback,
         checkpoint_fn=checkpoint_callback,
         validation_fn=validation_callback,

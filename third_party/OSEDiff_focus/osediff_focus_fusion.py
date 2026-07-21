@@ -295,6 +295,30 @@ def load_verified_checkpoint(checkpoint_path):
             f"checkpoint global_step mismatch: manifest={manifest['global_step']} "
             f"trainer_state={verified['trainer_state'].get('global_step')}"
         )
+    required_progress = (
+        "global_step", "current_epoch", "completed_epochs", "batches_consumed_in_current_epoch",
+        "micro_batches", "optimizer_updates", "scheduler_steps", "sampler_epoch",
+        "gradient_accumulation_steps",
+    )
+    for field in required_progress:
+        if field not in verified["trainer_state"]:
+            raise RuntimeError(f"[INVALID TRAINER STATE] missing required progress field: {field}")
+    trainer_state = verified["trainer_state"]
+    global_step = int(trainer_state["global_step"])
+    if int(trainer_state["optimizer_updates"]) != global_step:
+        raise RuntimeError(
+            f"[INVALID TRAINER STATE] optimizer_updates={trainer_state['optimizer_updates']} global_step={global_step}"
+        )
+    if int(trainer_state["scheduler_steps"]) != global_step:
+        raise RuntimeError(
+            f"[INVALID TRAINER STATE] scheduler_steps={trainer_state['scheduler_steps']} global_step={global_step}"
+        )
+    expected_min_micro_batches = global_step * int(trainer_state["gradient_accumulation_steps"])
+    if int(trainer_state["micro_batches"]) < expected_min_micro_batches:
+        raise RuntimeError(
+            "[INVALID TRAINER STATE] "
+            f"micro_batches={trainer_state['micro_batches']} expected_at_least={expected_min_micro_batches}"
+        )
     forbidden_progress = {
         "global_step", "current_epoch", "completed_epochs", "micro_batches",
         "optimizer_updates", "scheduler_steps", "batches_consumed_in_current_epoch",
@@ -496,7 +520,7 @@ class FocusFusionGenerator(nn.Module):
 
 
 def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd=None, accelerator=None,
-                       optimizer_group_manifest=None, completed_epochs=0, micro_steps_in_current_epoch=0,
+                       optimizer_group_manifest=None, completed_epochs=0, batch_position=0,
                        dataloader_position=0, sampler_epoch=None):
     unet_state = {k: v.detach().cpu() for k, v in model.unet.state_dict().items() if "lora" in k}
     input_mode = getattr(args, "input_mode", getattr(args, "condition_mode", model.condition_mode))

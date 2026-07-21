@@ -58,6 +58,7 @@ def test_run_training_loop_accumulation_four_max_steps_three():
         optimizer=optimizer,
         lr_scheduler=scheduler,
         progress=TrainingProgress(),
+        gradient_accumulation_steps=4,
         max_train_steps=3,
         checkpointing_steps=2,
         validation_steps=3,
@@ -87,6 +88,7 @@ def test_run_training_loop_resume_counts_only_remaining_updates():
         lr_scheduler=scheduler,
         max_train_steps=3,
         progress=TrainingProgress(global_step=1, optimizer_updates=1, scheduler_steps=1, micro_batches=4),
+        gradient_accumulation_steps=4,
         compute_loss_fn=lambda m, b: m(b),
     )
     assert result.optimizer_updates == 2
@@ -121,6 +123,7 @@ def test_accumulation_four_continuous_resume_4_8_12():
             optimizer=optimizer,
             lr_scheduler=scheduler,
             progress=progress,
+            gradient_accumulation_steps=4,
             max_train_steps=target,
             compute_loss_fn=lambda m, b: m(b),
         )

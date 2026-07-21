@@ -4,9 +4,12 @@ import pytest
 import torch
 
 from train_osediff_focus_fusion import (
+    assert_cli_argument_classification,
+    get_parser_argument_dests,
     parse_args,
     normalize_model_identifier,
-    resume_training_from_checkpoint,
+    TrainingProgress,
+    log_accelerator_resume_success,
     validate_sampler_resume_state,
     validate_resume_configuration,
     validate_resume_config,
@@ -69,46 +72,30 @@ class DummyAccelerator:
     scaler = None
 
 
-def test_resume_training_from_checkpoint_restores_only_trainer_progress_not_rng():
-    parameter = torch.nn.Parameter(torch.ones(2, requires_grad=True))
-    optimizer = torch.optim.SGD([{"name": "generator_unet_lora", "params": [parameter], "parameter_names": ["p"]}], lr=0.1)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    manifest = [{"name": "generator_unet_lora", "parameter_names": ["p"], "parameter_shapes": {"p": [2]}, "num_tensors": 1, "num_parameters": 2}]
+def test_training_progress_from_trainer_state_is_unique_resume_source():
     state = {
-        "optimizer_group_manifest": manifest,
-        "optimizer": optimizer.state_dict(),
-        "lr_scheduler": scheduler.state_dict(),
         "global_step": 3,
+        "current_epoch": 1,
         "completed_epochs": 1,
-        "micro_steps_in_current_epoch": 5,
+        "batches_consumed_in_current_epoch": 5,
+        "micro_batches": 12,
+        "optimizer_updates": 3,
+        "scheduler_steps": 3,
+        "sampler_epoch": 1,
     }
-    torch.manual_seed(999)
-    progress = resume_training_from_checkpoint(
-        trainer_state=state,
-        optimizer=optimizer,
-        lr_scheduler=scheduler,
-        accelerator=DummyAccelerator(),
-        optimizer_manifest=manifest,
-    )
-    assert progress["global_step"] == 3
-    assert progress["current_epoch"] == 1
-    assert progress["batches_consumed_in_current_epoch"] == 5
+    log_accelerator_resume_success(trainer_state=state)
+    progress = TrainingProgress.from_trainer_state(state)
+    assert progress.global_step == 3
+    assert progress.micro_batches == 12
 
 
-def test_resume_training_from_checkpoint_rejects_optimizer_manifest_conflict():
-    parameter = torch.nn.Parameter(torch.ones(2, requires_grad=True))
-    optimizer = torch.optim.SGD([{"name": "generator_unet_lora", "params": [parameter], "parameter_names": ["p"]}], lr=0.1)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    saved = [{"name": "generator_conv_in", "parameter_names": ["p"], "parameter_shapes": {"p": [2]}, "num_tensors": 1, "num_parameters": 2}]
-    current = [{"name": "generator_unet_lora", "parameter_names": ["p"], "parameter_shapes": {"p": [2]}, "num_tensors": 1, "num_parameters": 2}]
-    with pytest.raises(RuntimeError, match="name"):
-        resume_training_from_checkpoint(
-            trainer_state={"global_step": 0, "batches_consumed_in_current_epoch": 0, "optimizer_group_manifest": saved},
-            optimizer=optimizer,
-            lr_scheduler=scheduler,
-            accelerator=DummyAccelerator(),
-            optimizer_manifest=current,
-        )
+def test_training_progress_missing_field_errors():
+    with pytest.raises(ValueError, match="optimizer_updates"):
+        TrainingProgress.from_trainer_state({
+            "global_step": 1, "current_epoch": 0, "completed_epochs": 0,
+            "batches_consumed_in_current_epoch": 4, "micro_batches": 4,
+            "scheduler_steps": 1, "sampler_epoch": 0,
+        })
 
 
 def test_validate_sampler_resume_state_rejects_runtime_mismatches():
@@ -145,18 +132,47 @@ def test_validate_sampler_resume_state_rejects_runtime_mismatches():
 
 
 def test_legacy_lora_rank_parse_is_rejected_by_main_policy():
+    with pytest.raises(ValueError, match="deprecated"):
+        parse_args([
+            "--pretrained_model_name_or_path", "m",
+            "--metadata_path", "meta.json",
+            "--dataset_base_path", ".",
+            "--output_dir", "out",
+            "--lora_rank", "8",
+            "--lora_rank_vsd", "16",
+        ])
+
+
+def test_parse_args_classifies_all_current_cli_fields():
     args = parse_args([
-        "--pretrained_model_name_or_path", "m",
+        "--pretrained_model_name_or_path", "stabilityai/stable-diffusion-2-1-base",
         "--metadata_path", "meta.json",
         "--dataset_base_path", ".",
         "--output_dir", "out",
-        "--lora_rank", "8",
-        "--lora_rank_vsd", "16",
+        "--condition_mode", "ab_focus",
+        "--keep_a_composite",
+        "--keep_threshold", "0.4",
+        "--keep_soft_width", "0.2",
+        "--lora_rank_unet", "4",
+        "--lora_rank_vae", "2",
+        "--lora_rank_vsd", "6",
+        "--lr_num_cycles", "2",
+        "--lr_power", "0.5",
+        "--max_grad_norm", "0.7",
+        "--cfg_vsd", "5.5",
     ])
-    assert args.lora_rank == 8
-    with pytest.raises(ValueError, match="deprecated"):
-        if args.lora_rank is not None:
-            raise ValueError("--lora_rank is deprecated and no longer accepted. Use --lora_rank_unet, --lora_rank_vae and --lora_rank_vsd explicitly.")
+    assert args.condition_mode == "ab_focus"
+    assert args.keep_a_composite is True
+    assert args.lora_rank_unet == 4
+
+
+def test_parser_classification_helpers_reject_unclassified_dest():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--surprise_training_flag")
+    assert get_parser_argument_dests(parser) == {"surprise_training_flag"}
+    with pytest.raises(RuntimeError, match="unclassified CLI arguments"):
+        assert_cli_argument_classification(parser)
 
 
 def test_validate_resume_configuration_reports_multiple_mismatches():
