@@ -214,12 +214,16 @@ def write_json_atomically(path, data):
 
 
 def write_checkpoint_atomically(checkpoint_dir, model_state, trainer_state, optimizer_manifest, accelerator_state_present=False):
+    import shutil
+
     checkpoint_dir = Path(checkpoint_dir)
+    existing_accelerator_state = checkpoint_dir / "accelerator_state"
     tmp_dir = checkpoint_dir.with_name(checkpoint_dir.name + ".tmp")
     if tmp_dir.exists():
-        import shutil
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True)
+    if accelerator_state_present and existing_accelerator_state.is_dir():
+        shutil.copytree(existing_accelerator_state, tmp_dir / "accelerator_state")
     model_path = tmp_dir / "model_state.pt"
     trainer_path = tmp_dir / "trainer_state.json"
     optim_path = tmp_dir / "optimizer_manifest.json"
@@ -227,7 +231,6 @@ def write_checkpoint_atomically(checkpoint_dir, model_state, trainer_state, opti
     write_json_atomically(trainer_path, trainer_state)
     write_json_atomically(optim_path, optimizer_manifest)
     if checkpoint_dir.exists():
-        import shutil
         shutil.rmtree(checkpoint_dir)
     os.replace(tmp_dir, checkpoint_dir)
     manifest = {
@@ -256,6 +259,8 @@ def load_verified_checkpoint(checkpoint_path):
         manifest = json.load(handle)
     if manifest.get("complete") is not True or int(manifest.get("checkpoint_version", 0)) != 2:
         raise RuntimeError(f"invalid checkpoint manifest: {manifest_path}")
+    if manifest.get("accelerator_state_present") and not (checkpoint_dir / "accelerator_state").is_dir():
+        raise RuntimeError(f"accelerator_state directory missing: {checkpoint_dir / 'accelerator_state'}")
     verified = {"manifest": manifest, "checkpoint_dir": str(checkpoint_dir)}
     for key in ("model_state", "trainer_state", "optimizer_manifest"):
         entry = manifest[key]
@@ -335,16 +340,16 @@ def read_focus_checkpoint_config(checkpoint_path):
         "state": state,
         "input_mode": input_mode,
         "generator_in_channels": int(state["generator_in_channels"]),
-        "generator_lora_rank": int(state.get("rank_unet") or args.get("lora_rank_unet", 4)),
+        "generator_lora_rank": int(state.get("rank_unet") or args.get("lora_rank_unet", 8)),
         "generator_lora_adapter_name": state.get("generator_lora_adapter_name", "focus_fusion"),
         "generator_lora_targets": state.get("generator_unet_lora_targets", []),
         "train_conv_in": bool(state.get("train_conv_in", args.get("train_conv_in", True))),
         "train_vae_lora": bool(state.get("train_vae_lora", args.get("train_vae_lora", bool(state.get("vae_lora"))))),
-        "vae_lora_rank": int(state.get("rank_vae") or args.get("lora_rank_unet", 4)),
+        "vae_lora_rank": int(state.get("rank_vae") or args.get("lora_rank_vae", args.get("lora_rank_unet", 4))),
         "vae_lora_adapter_name": state.get("vae_lora_adapter_name", "focus_vae_encoder"),
         "vae_lora_targets": state.get("vae_lora_targets", []),
         "use_vsd": bool(state.get("use_vsd", args.get("use_vsd", bool(state.get("vsd_unet_lora"))))),
-        "vsd_lora_rank": int(state.get("rank_vsd", args.get("lora_rank", args.get("lora_rank_unet", 4)))),
+        "vsd_lora_rank": int(state.get("rank_vsd") or args.get("lora_rank_vsd", args.get("lora_rank", 8))),
         "vsd_lora_adapter_name": state.get("vsd_lora_adapter_name", "default_others"),
         "vsd_lora_targets": state.get("vsd_lora_targets", []),
         "prompt_mode": state.get("prompt_mode", args.get("prompt_mode", "fixed")),

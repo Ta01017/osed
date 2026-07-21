@@ -423,7 +423,7 @@ def main(args):
     from osediff_focus_fusion import expand_unet_conv_in
 
     if args.lora_rank is None:
-        args.lora_rank = args.lora_rank_unet
+        args.lora_rank = args.lora_rank_vsd
     args.input_mode = normalize_input_mode(args.condition_mode or args.input_mode)
     verified_resume = load_verified_checkpoint(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
     resume_cfg = read_focus_checkpoint_config(verified_resume["model_state"]) if verified_resume else None
@@ -607,13 +607,14 @@ def main(args):
                     accelerator.wait_for_everyone()
                 if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
                     accelerator.wait_for_everyone()
-                if accelerator.is_main_process and args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
-                    raw = accelerator.unwrap_model(model)
-                    raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
                     checkpoint_dir = Path(args.output_dir, "checkpoints", f"checkpoint-{global_step:08d}")
                     accelerator_state_dir = checkpoint_dir / "accelerator_state"
                     accelerator_state_dir.mkdir(parents=True, exist_ok=True)
                     accelerator.save_state(str(accelerator_state_dir))
+                    accelerator.wait_for_everyone()
+                if accelerator.is_main_process and args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
+                    raw = accelerator.unwrap_model(model)
+                    raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
                     payload = checkpoint_payload(
                         raw, global_step, args, optimizer, lr_scheduler, raw_reg, accelerator,
                         optimizer_group_manifest=current_manifest,
