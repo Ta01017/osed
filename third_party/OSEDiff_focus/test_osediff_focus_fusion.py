@@ -67,6 +67,11 @@ def main(args):
     args.condition_ablation = {"b_equals_a": "refs_equal_a", "b_zero": "refs_zero"}.get(args.condition_ablation, args.condition_ablation)
     if args.keep_a_composite and args.input_mode != "ab_focus":
         raise RuntimeError("--keep_a_composite is only valid for ab_focus")
+    if args.input_mode == "single":
+        if args.run_all_ablations:
+            raise RuntimeError("single input_mode supports only condition_ablation=normal; --run_all_ablations would include refs_equal_a/refs_zero")
+        if args.condition_ablation in ("refs_equal_a", "refs_zero"):
+            raise RuntimeError(f"single input_mode supports only condition_ablation=normal, got {args.condition_ablation}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.mixed_precision]
     if device.type == "cpu": dtype = torch.float32

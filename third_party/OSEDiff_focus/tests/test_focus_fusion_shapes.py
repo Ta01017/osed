@@ -4,6 +4,7 @@ import torch
 import pytest
 
 from osediff_focus_fusion import (
+    FocusFusionGenerator,
     INPUT_MODE_TO_CHANNELS,
     build_generator_unet_input,
     encode_rgb_conditions,
@@ -77,6 +78,26 @@ def test_build_inputs_all_modes_and_scheduler_sample_is_four():
             assert model_pred.shape[1] == sample.shape[1] == 4
             return SimpleNamespace(prev_sample=sample - model_pred)
     assert Scheduler().step(pred, None, z[0]).prev_sample.shape[1] == 4
+
+
+@pytest.mark.parametrize(
+    ("mode", "count", "has_focus", "channels"),
+    [("single", 1, False, 4), ("dual", 2, False, 8), ("ab_focus", 2, True, 10), ("quad_rgb", 4, False, 16)],
+)
+def test_make_unet_input_public_api_all_modes(mode, count, has_focus, channels):
+    unet = expand_unet_conv_in(DummyUNet(), channels)
+    model = FocusFusionGenerator(unet, DummyVAE(), SimpleNamespace(), mode)
+    latents = [torch.randn(1, 4, 8, 8) for _ in range(count)]
+    focus_a = torch.rand(1, 1, 64, 64) if has_focus else None
+    focus_b = torch.rand(1, 1, 64, 64) if has_focus else None
+    assert model.make_unet_input(latents, focus_a, focus_b).shape == (1, channels, 8, 8)
+
+
+def test_make_unet_input_error_reports_mode_count_and_focus():
+    unet = expand_unet_conv_in(DummyUNet(), 10)
+    model = FocusFusionGenerator(unet, DummyVAE(), SimpleNamespace(), "ab_focus")
+    with pytest.raises(ValueError, match="input_mode=ab_focus.*expected latent count=2.*actual latent count=1.*focus_a_present=False"):
+        model.make_unet_input([torch.randn(1, 4, 8, 8)])
 
 
 def test_multi_image_vae_order():

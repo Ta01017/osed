@@ -1,4 +1,5 @@
 __pycache__/
+**pycache**/
 *.py[cod]
 .pytest_cache/
 .coverage

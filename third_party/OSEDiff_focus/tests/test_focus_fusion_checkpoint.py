@@ -4,12 +4,16 @@ import pytest
 import torch
 
 from osediff_focus_fusion import (
+    capture_rng_state,
     checkpoint_payload,
+    checkpoint_complete_path,
     expand_unet_conv_in,
     load_focus_checkpoint,
     load_vae_lora_state,
     load_vsd_lora_state,
     read_focus_checkpoint_config,
+    restore_rng_state,
+    write_checkpoint_complete_manifest,
 )
 
 
@@ -119,3 +123,30 @@ def test_missing_conv_weight_and_missing_lora_states_error():
     state3["vsd_unet_lora"] = {}
     with pytest.raises(RuntimeError, match="VSD LoRA state is missing"):
         load_vsd_lora_state(TinyVSD(), state3)
+
+
+def test_rng_round_trip_restores_torch_sequence():
+    torch.manual_seed(123)
+    before = torch.rand(3)
+    state = capture_rng_state()
+    expected = torch.rand(3)
+    torch.manual_seed(999)
+    assert restore_rng_state(state)
+    actual = torch.rand(3)
+    torch.testing.assert_close(actual, expected)
+    assert not torch.equal(before, expected)
+
+
+def test_checkpoint_complete_manifest_and_strict_file_load(tmp_path):
+    model = TinyModel()
+    payload = checkpoint_payload(model, 9, _args())
+    checkpoint = tmp_path / "focus_fusion_9.pt"
+    torch.save(payload, checkpoint)
+    with pytest.raises(RuntimeError, match="complete manifest"):
+        load_focus_checkpoint(TinyModel(), str(checkpoint))
+    manifest = write_checkpoint_complete_manifest(checkpoint, payload)
+    assert manifest["complete"] is True
+    assert manifest["global_step"] == 9
+    assert checkpoint_complete_path(checkpoint).endswith(".complete.json")
+    restored = TinyModel()
+    load_focus_checkpoint(restored, str(checkpoint))
