@@ -1,7 +1,10 @@
 """One-step OSEDiff generator for native-resolution focus fusion."""
 import copy
+import os
+import random
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -138,11 +141,19 @@ def build_generator_unet_input(input_mode, latents, focus_a=None, focus_b=None):
     mode = normalize_input_mode(input_mode)
     needed = {"single": 1, "dual": 2, "ab_focus": 2, "quad_rgb": 4}[mode]
     if len(latents) != needed:
-        raise ValueError(f"{mode} requires {needed} RGB latents, got {len(latents)}")
+        raise ValueError(
+            f"make_unet_input input_mode={mode}: expected latent count={needed}, "
+            f"actual latent count={len(latents)}, focus_a_present={focus_a is not None}, "
+            f"focus_b_present={focus_b is not None}"
+        )
     parts = list(latents)
     if mode == "ab_focus":
         if focus_a is None or focus_b is None:
-            raise ValueError("ab_focus requires both focus maps")
+            raise ValueError(
+                f"make_unet_input input_mode={mode}: expected latent count={needed}, "
+                f"actual latent count={len(latents)}, focus_a_present={focus_a is not None}, "
+                f"focus_b_present={focus_b is not None}"
+            )
         size = latents[0].shape[-2:]
         parts += [F.interpolate(focus_a, size=size, mode="bilinear", align_corners=False),
                   F.interpolate(focus_b, size=size, mode="bilinear", align_corners=False)]
@@ -153,6 +164,45 @@ def build_generator_unet_input(input_mode, latents, focus_a=None, focus_b=None):
 
 def vae_scale_factor(vae):
     return 2 ** (len(vae.config.block_out_channels) - 1)
+
+
+def capture_rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(state):
+    if not state:
+        return False
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+    return True
+
+
+def checkpoint_complete_path(checkpoint_path):
+    return os.fspath(checkpoint_path) + ".complete.json"
+
+
+def write_checkpoint_complete_manifest(checkpoint_path, payload):
+    import json
+
+    manifest = {
+        "complete": True,
+        "format_version": int(payload.get("format_version", 0)),
+        "global_step": int(payload.get("global_step", payload.get("training_step", 0))),
+        "input_mode": payload.get("input_mode"),
+        "generator_in_channels": int(payload.get("generator_in_channels", 0)),
+    }
+    with open(checkpoint_complete_path(checkpoint_path), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+    return manifest
 
 
 def _load_lora_state(module, state, label):
@@ -237,8 +287,8 @@ class FocusFusionGenerator(nn.Module):
     def encode_images(self, *images, mode="sample"):
         return encode_rgb_conditions(list(images), self.vae, mode)
 
-    def make_unet_input(self, z_a, z_b, focus_a=None, focus_b=None):
-        return build_generator_unet_input(self.input_mode, [z_a, z_b], focus_a, focus_b)
+    def make_unet_input(self, latents, focus_a=None, focus_b=None):
+        return build_generator_unet_input(self.input_mode, list(latents), focus_a, focus_b)
 
     def forward(self, conditions, focus_a=None, focus_b=None, prompt_embeds=None, vae_encode_mode="sample",
                 tiled=False, tile_size=96, tile_overlap=32, latent_overrides=None):
@@ -250,7 +300,7 @@ class FocusFusionGenerator(nn.Module):
             for idx, value in latent_overrides.items():
                 latents[idx] = value.to(device=latents[0].device, dtype=latents[0].dtype)
         z_a = latents[0]
-        unet_input = build_generator_unet_input(self.input_mode, latents, focus_a, focus_b)
+        unet_input = self.make_unet_input(latents, focus_a, focus_b)
         ts = self.timesteps.to(a.device)
         if hasattr(self.scheduler, "alphas_cumprod") and self.scheduler.alphas_cumprod.device != z_a.device:
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(z_a.device)
@@ -271,7 +321,9 @@ class FocusFusionGenerator(nn.Module):
         return output, denoised, pred
 
 
-def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd=None, accelerator=None):
+def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd=None, accelerator=None,
+                       optimizer_group_manifest=None, completed_epochs=0, micro_steps_in_current_epoch=0,
+                       dataloader_position=0, sampler_epoch=None):
     unet_state = {k: v.detach().cpu() for k, v in model.unet.state_dict().items() if "lora" in k}
     input_mode = getattr(args, "input_mode", getattr(args, "condition_mode", model.condition_mode))
     return {"format_version": 2, "input_mode": normalize_input_mode(input_mode), "condition_mode": model.condition_mode,
@@ -297,7 +349,16 @@ def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd
             "cache_fixed_prompt_embedding": bool(getattr(args, "cache_fixed_prompt_embedding", True)),
             "fixed_prompt_embedding": model.fixed_prompt_embedding.cpu(),
             "training_step": int(step), "global_step": int(step),
+            "completed_epochs": int(completed_epochs),
+            "micro_steps_in_current_epoch": int(micro_steps_in_current_epoch),
+            "dataloader_position": int(dataloader_position),
+            "sampler_epoch": sampler_epoch,
             "gradient_accumulation_steps": int(getattr(args, "gradient_accumulation_steps", 1)),
+            "world_size": int(getattr(accelerator, "num_processes", 1)) if accelerator is not None else 1,
+            "train_batch_size": int(getattr(args, "train_batch_size", 1)),
+            "optimizer_group_manifest": optimizer_group_manifest or [],
+            "rng_state": capture_rng_state(),
+            "scaler_state": getattr(getattr(accelerator, "scaler", None), "state_dict", lambda: None)() if accelerator is not None else None,
             "args": vars(args).copy(),
             "optimizer": optimizer.state_dict() if optimizer else None,
             "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler else None}
@@ -305,6 +366,8 @@ def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd
 
 def load_focus_checkpoint(model, checkpoint, load_lora=True):
     state = torch.load(checkpoint, map_location="cpu") if isinstance(checkpoint, (str, bytes)) else checkpoint
+    if isinstance(checkpoint, (str, bytes)) and not os.path.exists(checkpoint_complete_path(checkpoint)):
+        raise RuntimeError(f"checkpoint is missing complete manifest: {checkpoint_complete_path(checkpoint)}")
     if state.get("input_mode", state.get("condition_mode")) != model.condition_mode:
         raise RuntimeError(f"input_mode mismatch: checkpoint={state.get('input_mode', state.get('condition_mode'))} model={model.condition_mode}")
     if model.unet.conv_in.in_channels != state["generator_in_channels"]:

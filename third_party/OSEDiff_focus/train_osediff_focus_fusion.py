@@ -1,6 +1,7 @@
 """Train the one-step OSEDiff focus-fusion generator."""
 import argparse
 import os
+import tempfile
 from pathlib import Path
 
 import torch
@@ -12,7 +13,10 @@ from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PR
 from osediff_focus_fusion import (FocusFusionGenerator, checkpoint_payload, gradient_loss,
                                   laplacian_loss, masked_l1, move_scheduler_to_device,
                                   get_generator_in_channels, normalize_input_mode, vae_scale_factor,
-                                  load_vae_lora_state, load_vsd_lora_state)
+                                  load_vae_lora_state, load_vsd_lora_state,
+                                  read_focus_checkpoint_config, load_focus_checkpoint,
+                                  capture_rng_state, restore_rng_state,
+                                  write_checkpoint_complete_manifest)
 
 
 def parse_args(argv=None):
@@ -73,44 +77,92 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def _add_generator_lora(unet, rank):
+def _add_generator_lora(unet, rank, targets=None, adapter_name="focus_fusion"):
     from peft import LoraConfig
-    targets = sorted({n.rsplit(".", 1)[0] for n, p in unet.named_parameters()
+    targets = targets or sorted({n.rsplit(".", 1)[0] for n, p in unet.named_parameters()
                       if p.ndim >= 2 and "conv_in" not in n and any(x in n for x in ("to_q", "to_k", "to_v", "to_out.0"))})
     if not targets: raise RuntimeError("no UNet attention modules found for LoRA")
-    unet.add_adapter(LoraConfig(r=rank, init_lora_weights="gaussian", target_modules=targets), adapter_name="focus_fusion")
+    unet.add_adapter(LoraConfig(r=rank, init_lora_weights="gaussian", target_modules=targets), adapter_name=adapter_name)
+    unet.set_adapter([adapter_name])
     return targets
 
 
-def _add_vae_lora(vae, rank):
+def _add_vae_lora(vae, rank, targets=None, adapter_name="focus_vae_encoder"):
     from peft import LoraConfig
     patterns = ("conv1", "conv2", "conv_in", "conv_shortcut", "conv", "conv_out", "to_k", "to_q", "to_v", "to_out.0")
-    targets = []
-    for name, param in vae.named_parameters():
-        if "bias" in name or "norm" in name or param.ndim < 2:
-            continue
-        if ("encoder" in name and any(p in name for p in patterns)) or ("quant_conv" in name and "post_quant_conv" not in name):
-            targets.append(name.replace(".weight", ""))
-    targets = sorted(set(targets))
+    if targets is None:
+        targets = []
+        for name, param in vae.named_parameters():
+            if "bias" in name or "norm" in name or param.ndim < 2:
+                continue
+            if ("encoder" in name and any(p in name for p in patterns)) or ("quant_conv" in name and "post_quant_conv" not in name):
+                targets.append(name.replace(".weight", ""))
+        targets = sorted(set(targets))
     if not targets:
         raise RuntimeError("no VAE encoder modules found for LoRA")
-    vae.add_adapter(LoraConfig(r=rank, init_lora_weights="gaussian", target_modules=targets), adapter_name="focus_vae_encoder")
-    vae.set_adapter(["focus_vae_encoder"])
+    vae.add_adapter(LoraConfig(r=rank, init_lora_weights="gaussian", target_modules=targets), adapter_name=adapter_name)
+    vae.set_adapter([adapter_name])
     return targets
+
+
+def _named_params(module, predicate, prefix=""):
+    return [(prefix + n, p) for n, p in module.named_parameters() if predicate(n, p)]
+
+
+def optimizer_group_manifest(param_groups):
+    seen = set()
+    manifest = []
+    for group in param_groups:
+        names = group.get("parameter_names", [])
+        shapes = group.get("parameter_shapes", {})
+        for p in group["params"]:
+            if id(p) in seen:
+                raise RuntimeError("same Parameter appears in multiple optimizer groups")
+            seen.add(id(p))
+            if not p.requires_grad:
+                raise RuntimeError(f"frozen parameter in optimizer group {group['name']}")
+        manifest.append({
+            "name": group["name"],
+            "parameter_names": list(names),
+            "parameter_shapes": {k: list(v) for k, v in shapes.items()},
+            "num_tensors": len(group["params"]),
+            "num_parameters": int(sum(p.numel() for p in group["params"])),
+        })
+    return manifest
+
+
+def validate_optimizer_manifest(saved, current):
+    if saved is None:
+        raise RuntimeError("checkpoint optimizer_group_manifest is missing")
+    if len(saved) != len(current):
+        raise RuntimeError(f"optimizer group count mismatch: checkpoint={len(saved)} current={len(current)}")
+    for old, new in zip(saved, current):
+        for key in ("name", "num_tensors", "num_parameters"):
+            if old.get(key) != new.get(key):
+                raise RuntimeError(f"optimizer group manifest mismatch for {new.get('name')}: {key} checkpoint={old.get(key)} current={new.get(key)}")
+        if set(old.get("parameter_names", [])) != set(new.get("parameter_names", [])):
+            raise RuntimeError(f"optimizer group parameter names mismatch for {new['name']}")
+        if old.get("parameter_shapes", {}) != new.get("parameter_shapes", {}):
+            raise RuntimeError(f"optimizer group parameter shapes mismatch for {new['name']}")
 
 
 def _groups(model, args, vsd=None):
     groups = []
-    lora = [p for n, p in model.unet.named_parameters() if "lora" in n and p.requires_grad]
-    groups.append({"name": "generator_unet_lora", "params": lora})
+    named = _named_params(model.unet, lambda n, p: "lora" in n and p.requires_grad, "unet.")
+    groups.append({"name": "generator_unet_lora", "params": [p for _, p in named], "parameter_names": [n for n, _ in named]})
     if args.train_conv_in:
         model.unet.conv_in.requires_grad_(True)
-        groups.append({"name": "generator_conv_in", "params": list(model.unet.conv_in.parameters())})
+        named = _named_params(model.unet.conv_in, lambda n, p: p.requires_grad, "unet.conv_in.")
+        groups.append({"name": "generator_conv_in", "params": [p for _, p in named], "parameter_names": [n for n, _ in named]})
     if args.train_vae_lora:
-        groups.append({"name": "vae_lora", "params": [p for n, p in model.vae.named_parameters() if "lora" in n and p.requires_grad]})
+        named = _named_params(model.vae, lambda n, p: "lora" in n and p.requires_grad, "vae.")
+        groups.append({"name": "vae_lora", "params": [p for _, p in named], "parameter_names": [n for n, _ in named]})
     if vsd is not None:
-        groups.append({"name": "vsd_update_lora", "params": [p for n, p in vsd.unet_update.named_parameters() if "lora" in n and p.requires_grad]})
+        named = _named_params(vsd.unet_update, lambda n, p: "lora" in n and p.requires_grad, "vsd.unet_update.")
+        groups.append({"name": "vsd_update_lora", "params": [p for _, p in named], "parameter_names": [n for n, _ in named]})
     groups = [g for g in groups if g["params"]]
+    for g in groups:
+        g["parameter_shapes"] = {name: tuple(p.shape) for name, p in zip(g["parameter_names"], g["params"])}
     seen = set()
     for g in groups:
         for p in g["params"]:
@@ -126,7 +178,7 @@ def _groups(model, args, vsd=None):
     total = 0
     for g in groups:
         count = sum(p.numel() for p in g["params"]); train = sum(p.numel() for p in g["params"] if p.requires_grad); total += train
-        print(f"optimizer group {g['name']}: tensors={len(g['params'])}, parameters={count:,}, requires_grad={train:,}")
+        print(f"optimizer group {g['name']}: tensors={len(g['params'])}, parameters={count:,}, trainable={train:,}")
     print(f"total trainable parameters: {total:,}")
     return groups
 
@@ -174,53 +226,62 @@ def run_validation(model, loader, encode_fn, args, accelerator, step):
         return
     raw_model = accelerator.unwrap_model(model)
     was_training = raw_model.training
-    raw_model.eval()
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    out_root = Path(args.output_dir, "validation", f"global_step_{step:06d}")
-    out_root.mkdir(parents=True, exist_ok=True)
-    for batch in loader:
-        prompts = batch["prompt"]
-        if args.prompt_mode == "fixed" and raw_model.fixed_prompt_embedding.numel():
-            emb = raw_model.fixed_prompt_embedding.to(accelerator.device).expand(len(prompts), -1, -1)
-        else:
-            emb = encode_fn(prompts, accelerator.device)
-        conditions = [x.to(accelerator.device) for x in batch["conditions"]]
-        gt = batch["gt"].to(accelerator.device)
-        focus_maps = [x.to(accelerator.device) for x in batch["focus_maps"]]
-        fa = focus_maps[0] if focus_maps else None
-        fb = focus_maps[1] if len(focus_maps) > 1 else None
-        pred, _, _ = raw_model(conditions, fa, fb, emb, "mode")
-        final = pred
-        if args.keep_a_composite:
-            if args.input_mode != "ab_focus":
-                raise RuntimeError("--keep_a_composite is only valid for ab_focus")
-            keep = _soft_keep(fa, args.keep_threshold, args.keep_soft_width)
-            final = keep * conditions[0] + (1 - keep) * pred
-        idx = int(batch["metadata_index"].item())
-        folder = out_root / f"{idx:06d}"
-        folder.mkdir(parents=True, exist_ok=True)
-        images = {"GT.png": _pil(gt), "pred_raw.png": _pil(pred), "final.png": _pil(final)}
-        for i, cond in enumerate(conditions):
-            images[f"{chr(ord('A') + i)}.png"] = _pil(cond)
-        for i, fmap in enumerate(focus_maps):
-            images[f"focus_{i}.png"] = _pil(fmap, True)
-        if args.keep_a_composite:
-            images["pred_keepa_composite.png"] = _pil(final)
-        for name, image in images.items():
-            image.save(folder / name)
-        panel_names = [f"{chr(ord('A') + i)}.png" for i in range(len(conditions))] + ["GT.png"] + [f"focus_{i}.png" for i in range(len(focus_maps))] + ["pred_raw.png"]
-        if args.keep_a_composite:
-            panel_names.append("pred_keepa_composite.png")
-        panels = [images[n].convert("RGB") for n in panel_names]
-        canvas = Image.new("RGB", (sum(p.width for p in panels), max(p.height for p in panels)))
-        x = 0
-        for panel in panels:
-            canvas.paste(panel, (x, 0)); x += panel.width
-        canvas.save(folder / "comparison.png")
-    if was_training:
-        raw_model.train()
+    rng_state = capture_rng_state()
+    try:
+        raw_model.eval()
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        out_root = Path(args.output_dir, "validation", f"global_step_{step:06d}")
+        out_root.mkdir(parents=True, exist_ok=True)
+        for batch in loader:
+            prompts = batch["prompt"]
+            if args.prompt_mode == "fixed" and raw_model.fixed_prompt_embedding.numel():
+                emb = raw_model.fixed_prompt_embedding.to(accelerator.device).expand(len(prompts), -1, -1)
+            else:
+                emb = encode_fn(prompts, accelerator.device)
+            conditions = [x.to(accelerator.device) for x in batch["conditions"]]
+            gt = batch["gt"].to(accelerator.device)
+            focus_maps = [x.to(accelerator.device) for x in batch["focus_maps"]]
+            fa = focus_maps[0] if focus_maps else None
+            fb = focus_maps[1] if len(focus_maps) > 1 else None
+            pred, _, _ = raw_model(conditions, fa, fb, emb, "mode")
+            final = pred
+            if args.keep_a_composite:
+                if args.input_mode != "ab_focus":
+                    raise RuntimeError("--keep_a_composite is only valid for ab_focus")
+                keep = _soft_keep(fa, args.keep_threshold, args.keep_soft_width)
+                final = keep * conditions[0] + (1 - keep) * pred
+            idx = int(batch["metadata_index"].item())
+            folder = out_root / f"{idx:06d}"
+            folder.mkdir(parents=True, exist_ok=True)
+            images = {"GT.png": _pil(gt), "pred_raw.png": _pil(pred), "final.png": _pil(final)}
+            for i, cond in enumerate(conditions):
+                images[f"{chr(ord('A') + i)}.png"] = _pil(cond)
+            for i, fmap in enumerate(focus_maps):
+                images[f"focus_{i}.png"] = _pil(fmap, True)
+            if args.keep_a_composite:
+                images["pred_keepa_composite.png"] = _pil(final)
+            for name, image in images.items():
+                image.save(folder / name)
+            panel_names = [f"{chr(ord('A') + i)}.png" for i in range(len(conditions))] + ["GT.png"] + [f"focus_{i}.png" for i in range(len(focus_maps))] + ["pred_raw.png"]
+            if args.keep_a_composite:
+                panel_names.append("pred_keepa_composite.png")
+            panels = [images[n].convert("RGB") for n in panel_names]
+            canvas = Image.new("RGB", (sum(p.width for p in panels), max(p.height for p in panels)))
+            x = 0
+            for panel in panels:
+                canvas.paste(panel, (x, 0))
+                x += panel.width
+            canvas.save(folder / "comparison.png")
+            pred_saved = Image.open(folder / "pred_raw.png")
+            a_saved = Image.open(folder / "A.png")
+            if pred_saved.size != a_saved.size:
+                raise RuntimeError(f"validation saved size mismatch: pred_raw={pred_saved.size}, A={a_saved.size}")
+    finally:
+        restore_rng_state(rng_state)
+        if was_training:
+            raw_model.train()
 
 
 def main(args):
@@ -232,11 +293,33 @@ def main(args):
     from models.autoencoder_kl import AutoencoderKL
     from models.unet_2d_condition import UNet2DConditionModel
     from osediff import OSEDiff_reg
-    from osediff_focus_fusion import expand_unet_conv_in, load_focus_checkpoint
+    from osediff_focus_fusion import expand_unet_conv_in
 
     if args.lora_rank is None:
         args.lora_rank = args.lora_rank_unet
     args.input_mode = normalize_input_mode(args.condition_mode or args.input_mode)
+    resume_cfg = read_focus_checkpoint_config(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
+    if resume_cfg:
+        allowed_overrides = {"max_train_steps", "validation_steps", "checkpointing_steps", "output_dir"}
+        print("[RESUME] allowed CLI overrides:", sorted(allowed_overrides))
+        structural = {
+            "input_mode": args.input_mode,
+            "generator_lora_rank": args.lora_rank_unet,
+            "train_conv_in": args.train_conv_in,
+            "train_vae_lora": args.train_vae_lora,
+            "use_vsd": bool(args.use_vsd),
+            "prompt_mode": args.prompt_mode,
+        }
+        for name, cli_value in structural.items():
+            ckpt_value = resume_cfg[name]
+            if cli_value != ckpt_value:
+                raise RuntimeError(f"resume structural parameter conflict: {name}: checkpoint={ckpt_value} CLI={cli_value}")
+        args.input_mode = resume_cfg["input_mode"]
+        args.lora_rank_unet = resume_cfg["generator_lora_rank"]
+        args.train_conv_in = resume_cfg["train_conv_in"]
+        args.train_vae_lora = resume_cfg["train_vae_lora"]
+        args.use_vsd = int(resume_cfg["use_vsd"])
+        args.prompt_mode = resume_cfg["prompt_mode"]
     if args.input_mode != "ab_focus" and (args.lambda_keep or args.lambda_bref):
         print(f"WARNING: keep-A and B-reference losses are disabled for input_mode={args.input_mode}; no fake masks will be created")
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, mixed_precision=args.mixed_precision)
@@ -249,8 +332,17 @@ def main(args):
     # Required order: base UNet -> expand conv_in -> add adapters.
     expand_unet_conv_in(unet, get_generator_in_channels(args.input_mode))
     unet.requires_grad_(False); vae.requires_grad_(False); text_encoder.requires_grad_(False)
-    lora_targets = _add_generator_lora(unet, args.lora_rank_unet)
-    vae_lora_targets = _add_vae_lora(vae, args.lora_rank_unet) if args.train_vae_lora else []
+    lora_targets = _add_generator_lora(
+        unet, args.lora_rank_unet,
+        targets=resume_cfg["generator_lora_targets"] if resume_cfg else None,
+        adapter_name=resume_cfg["generator_lora_adapter_name"] if resume_cfg else "focus_fusion",
+    )
+    vae_lora_targets = _add_vae_lora(
+        vae,
+        resume_cfg["vae_lora_rank"] if resume_cfg else args.lora_rank_unet,
+        targets=resume_cfg["vae_lora_targets"] if resume_cfg else None,
+        adapter_name=resume_cfg["vae_lora_adapter_name"] if resume_cfg else "focus_vae_encoder",
+    ) if args.train_vae_lora else []
     for n, p in unet.named_parameters(): p.requires_grad_("lora" in n)
     for n, p in vae.named_parameters(): p.requires_grad_("lora" in n)
     scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -262,11 +354,19 @@ def main(args):
     model.lora_rank_unet = args.lora_rank_unet
     model.focus_vae_lora_targets = vae_lora_targets
     model.lora_rank_vae = args.lora_rank_unet
+    model.generator_lora_adapter_name = resume_cfg["generator_lora_adapter_name"] if resume_cfg else "focus_fusion"
+    model.vae_lora_adapter_name = resume_cfg["vae_lora_adapter_name"] if resume_cfg else "focus_vae_encoder"
     model_reg = OSEDiff_reg(args=args, accelerator=accelerator) if args.use_vsd else None
     if model_reg is not None:
         model_reg.set_train()
         assert model_reg.unet_fix.config.in_channels == 4
         assert model_reg.unet_update.config.in_channels == 4
+    resume_state = None
+    if resume_cfg:
+        resume_state = load_focus_checkpoint(model, args.resume_from_checkpoint)
+        load_vae_lora_state(model, resume_state)
+        if model_reg is not None:
+            load_vsd_lora_state(model_reg, resume_state)
 
     def encode(prompts, device):
         ids = tokenizer(prompts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(device)
@@ -295,34 +395,51 @@ def main(args):
     loader = DataLoader(dataset, args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers, collate_fn=focus_fusion_collate)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=focus_fusion_collate)
     param_groups = _groups(model, args, model_reg)
+    current_manifest = optimizer_group_manifest(param_groups)
     optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate)
+    for group in optimizer.param_groups:
+        print(
+            f"optimizer group {group['name']}: tensors={len(group['params'])}, "
+            f"lr={group['lr']}, weight_decay={group['weight_decay']}"
+        )
     lr_scheduler = get_scheduler(args.lr_scheduler, optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles, power=args.lr_power)
-    start = 0
-    pending_lr_state = None
-    if args.resume_from_checkpoint:
-        state = load_focus_checkpoint(model, args.resume_from_checkpoint)
-        load_vae_lora_state(model, state)
-        if model_reg is not None:
-            load_vsd_lora_state(model_reg, state)
-        if state.get("optimizer"):
-            if len(state["optimizer"].get("param_groups", [])) != len(optimizer.param_groups):
-                raise RuntimeError("optimizer parameter group count mismatch during resume")
-            optimizer.load_state_dict(state["optimizer"])
-        pending_lr_state = state.get("lr_scheduler")
-        start = state.get("global_step", state.get("training_step", 0))
-    if pending_lr_state:
-        lr_scheduler.load_state_dict(pending_lr_state)
+    start = int(resume_state.get("global_step", resume_state.get("training_step", 0))) if resume_state else 0
+    completed_epochs = int(resume_state.get("completed_epochs", 0)) if resume_state else 0
+    resume_micro_steps = int(resume_state.get("micro_steps_in_current_epoch", resume_state.get("dataloader_position", 0))) if resume_state else 0
     if model_reg is None:
-        model, text_encoder, optimizer, loader, val_loader, lr_scheduler = accelerator.prepare(model, text_encoder, optimizer, loader, val_loader, lr_scheduler)
+        model, text_encoder, optimizer, loader, lr_scheduler = accelerator.prepare(model, text_encoder, optimizer, loader, lr_scheduler)
     else:
-        model, model_reg, text_encoder, optimizer, loader, val_loader, lr_scheduler = accelerator.prepare(model, model_reg, text_encoder, optimizer, loader, val_loader, lr_scheduler)
+        model, model_reg, text_encoder, optimizer, loader, lr_scheduler = accelerator.prepare(model, model_reg, text_encoder, optimizer, loader, lr_scheduler)
+    if resume_state:
+        validate_optimizer_manifest(resume_state.get("optimizer_group_manifest"), current_manifest)
+        if resume_state.get("optimizer"):
+            optimizer.load_state_dict(resume_state["optimizer"])
+            print("[RESUME] optimizer restored")
+        if resume_state.get("lr_scheduler"):
+            lr_scheduler.load_state_dict(resume_state["lr_scheduler"])
+            print("[RESUME] scheduler restored")
+        scaler = getattr(accelerator, "scaler", None)
+        if scaler is not None and resume_state.get("scaler_state"):
+            scaler.load_state_dict(resume_state["scaler_state"])
+            print("[RESUME] scaler restored")
+        if restore_rng_state(resume_state.get("rng_state")):
+            print("[RESUME] RNG restored")
+        print(f"[RESUME] checkpoint global_step {start}")
+        print(f"[RESUME] completed_epochs {completed_epochs}")
+        print(f"[RESUME] micro_steps_in_current_epoch {resume_micro_steps}")
+        print(f"[RESUME] dataloader batches skipped {resume_micro_steps}")
     global_step = int(start)
     optimizer.zero_grad(set_to_none=True)
     while global_step < args.max_train_steps:
-        for batch in loader:
+        micro_steps_in_current_epoch = 0
+        for batch_idx, batch in enumerate(loader):
+            if resume_micro_steps and batch_idx < resume_micro_steps:
+                continue
+            resume_micro_steps = 0
+            micro_steps_in_current_epoch = batch_idx + 1
             with accelerator.accumulate(model):
                 prompts = batch["prompt"]
                 if args.prompt_mode == "ram":
@@ -377,13 +494,32 @@ def main(args):
                         log_losses["keep"] = "disabled"; log_losses["bref"] = "disabled"
                     print(global_step, log_losses)
                 if args.validation_steps > 0 and global_step % args.validation_steps == 0:
+                    accelerator.wait_for_everyone()
                     run_validation(model, val_loader, encode, args, accelerator, global_step)
-                if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
+                    accelerator.wait_for_everyone()
+                if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
+                    accelerator.wait_for_everyone()
+                if accelerator.is_main_process and args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
                     raw = accelerator.unwrap_model(model)
                     raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
-                    torch.save(checkpoint_payload(raw, global_step, args, optimizer, lr_scheduler, raw_reg, accelerator), Path(args.output_dir, "checkpoints", f"focus_fusion_{global_step}.pt"))
+                    final_path = Path(args.output_dir, "checkpoints", f"focus_fusion_{global_step}.pt")
+                    payload = checkpoint_payload(
+                        raw, global_step, args, optimizer, lr_scheduler, raw_reg, accelerator,
+                        optimizer_group_manifest=current_manifest,
+                        completed_epochs=completed_epochs,
+                        micro_steps_in_current_epoch=micro_steps_in_current_epoch,
+                        dataloader_position=micro_steps_in_current_epoch,
+                    )
+                    with tempfile.NamedTemporaryFile(dir=final_path.parent, suffix=".tmp", delete=False) as tmp:
+                        tmp_path = Path(tmp.name)
+                    torch.save(payload, tmp_path)
+                    os.replace(tmp_path, final_path)
+                    write_checkpoint_complete_manifest(final_path, payload)
+                if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
+                    accelerator.wait_for_everyone()
                 if global_step >= args.max_train_steps:
                     break
+        completed_epochs += 1
 
 
 if __name__ == "__main__": main(parse_args())

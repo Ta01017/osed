@@ -71,11 +71,14 @@ def parse_metadata_inputs(item, input_mode, metadata_index):
 
     explicit = parse_explicit()
     legacy = parse_edit()
-    if explicit and legacy and explicit != legacy:
-        raise ValueError(
-            f"metadata index {metadata_index}, input_mode {mode}: condition_images/focus_maps conflict with edit_image; "
-            f"condition_images={item.get('condition_images')}, focus_maps={item.get('focus_maps')}, edit_image={item.get('edit_image')}"
-        )
+    if explicit and legacy:
+        def normalized_pair(pair):
+            return tuple(tuple(str(Path(x)) for x in values) for values in pair)
+        if normalized_pair(explicit) != normalized_pair(legacy):
+            raise ValueError(
+                f"metadata index {metadata_index}, input_mode {mode}: condition_images/focus_maps conflict with edit_image; "
+                f"condition_images={item.get('condition_images')}, focus_maps={item.get('focus_maps')}, edit_image={item.get('edit_image')}"
+            )
     result = explicit or legacy
     if result is None:
         raise ValueError(f"metadata index {metadata_index}, input_mode {mode}: missing condition_images or edit_image")
