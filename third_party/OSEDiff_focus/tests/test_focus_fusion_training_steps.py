@@ -59,14 +59,14 @@ def test_run_training_loop_accumulation_four_max_steps_three():
         checkpointing_steps=2,
         validation_steps=3,
         compute_loss_fn=lambda m, b: m(b),
-        checkpoint_fn=checkpoints.append,
-        validation_fn=validations.append,
+        checkpoint_fn=lambda p, losses: checkpoints.append(p.global_step),
+        validation_fn=lambda p: validations.append(p.global_step),
     )
-    assert result["forward_micro_batches"] == 12
-    assert result["backward_calls"] == 12
-    assert result["optimizer_steps"] == 3
+    assert result.micro_batches == 12
+    assert result.backward_calls == 12
+    assert result.optimizer_updates == 3
     assert scheduler.count == 3
-    assert result["global_step"] == 3
+    assert result.global_step == 3
     assert checkpoints == [2]
     assert validations == [3]
 
@@ -86,9 +86,9 @@ def test_run_training_loop_resume_counts_only_remaining_updates():
         global_step=1,
         compute_loss_fn=lambda m, b: m(b),
     )
-    assert result["optimizer_steps"] == 2
-    assert result["scheduler_steps"] == 2
-    assert result["global_step"] == 3
+    assert result.optimizer_updates == 2
+    assert result.scheduler_steps == 2
+    assert result.global_step == 3
 
 
 def test_simulation_remains_auxiliary_only():

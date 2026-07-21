@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT, focus_fusion_collate
 from osediff_focus_fusion import (FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint,
                                   move_scheduler_to_device, normalize_input_mode, read_focus_checkpoint_config,
-                                  load_vae_lora_state, load_verified_checkpoint)
+                                  load_vae_lora_state, load_verified_checkpoint, resolve_prompt_embedding)
 
 
 def parse_args(argv=None):
@@ -80,12 +80,43 @@ def ablation_latents_and_focus(input_mode, mode, base_latents, focus_maps):
     raise ValueError(f"unknown condition ablation: {mode}")
 
 
+def build_ablation_debug_inputs(input_mode, ablation_mode, original_conditions, original_focus_maps):
+    used = [x.clone() for x in original_conditions]
+    focus_used = [x.clone() for x in original_focus_maps]
+    meta = {"mode": ablation_mode, "A_condition": "original_latent"}
+    if ablation_mode == "refs_equal_a":
+        for i in range(1, len(used)):
+            used[i] = used[0].clone()
+            meta[f"{chr(ord('A') + i)}_condition"] = "A_latent_clone"
+        if input_mode == "ab_focus" and len(focus_used) > 1:
+            focus_used[1] = focus_used[0].clone()
+            meta["focus_B_condition"] = "focus_A_clone"
+    elif ablation_mode == "refs_zero":
+        for i in range(1, len(used)):
+            used[i] = torch.zeros_like(used[i])
+            meta[f"{chr(ord('A') + i)}_condition"] = "zero_latent"
+            meta[f"{chr(ord('A') + i)}_debug_image"] = "zero_tensor_proxy_not_vae_inverse"
+        if input_mode == "ab_focus" and len(focus_used) > 1:
+            focus_used[1] = torch.zeros_like(focus_used[1])
+            meta["focus_B_condition"] = "zero_focus"
+    else:
+        for i in range(len(used)):
+            meta[f"{chr(ord('A') + i)}_condition"] = "original_latent"
+    return used, focus_used, meta
+
+
 def run_ablation_from_latents(model, input_mode, mode, base_latents, focus_maps, prompt_embeds, args):
     latents, ablated_focus = ablation_latents_and_focus(input_mode, mode, base_latents, focus_maps)
     fa = ablated_focus[0] if ablated_focus else None
     fb = ablated_focus[1] if len(ablated_focus) > 1 else None
     with torch.no_grad():
-        return model.forward_from_latents(latents, fa, fb, prompt_embeds, args.tiled, args.latent_tiled_size, args.latent_tiled_overlap)[0]
+        return model.forward_from_latents(
+            latents, fa, fb, prompt_embeds,
+            expected_output_hw=args.expected_output_hw,
+            tiled=args.tiled,
+            tile_size=args.latent_tiled_size,
+            tile_overlap=args.latent_tiled_overlap,
+        )[0]
 
 
 def main(args):
@@ -115,7 +146,7 @@ def main(args):
     cached_prompt = state.get("fixed_prompt_embedding")
     have_cached_prompt = args.prompt_mode == "fixed" and args.cache_fixed_prompt_embedding and cached_prompt is not None and cached_prompt.numel()
     tokenizer = text = None
-    if not have_cached_prompt:
+    if not have_cached_prompt and args.prompt_mode != "fixed":
         tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
         text = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
@@ -152,9 +183,22 @@ def main(args):
         input_mode=args.input_mode, vae_scale_factor=2 ** (len(vae.config.block_out_channels) - 1),
         max_pixels=args.max_pixels)
 
+    fixed_prompt_resolution = None
+    if args.prompt_mode == "fixed":
+        fixed_prompt_resolution = resolve_prompt_embedding(
+            checkpoint_state=state,
+            checkpoint_config=ckpt,
+            pretrained_model_name_or_path=args.pretrained_model_name_or_path,
+            prompt_text=ckpt.get("fixed_prompt"),
+            batch_size=1,
+            device=device,
+            dtype=dtype,
+        )
+        print(f"prompt_embedding_source: {fixed_prompt_resolution['source']}")
+
     def embeds(prompts):
-        cached = model.fixed_prompt_embedding
-        if args.prompt_mode == "fixed" and cached.numel(): return cached.to(device, dtype=dtype).expand(len(prompts), -1, -1)
+        if args.prompt_mode == "fixed" and fixed_prompt_resolution is not None:
+            return fixed_prompt_resolution["embedding"].expand(len(prompts), -1, -1)
         if tokenizer is None or text is None:
             raise RuntimeError("fixed prompt embedding is absent; tokenizer/text encoder must be available")
         ids = tokenizer(prompts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(device)
@@ -163,6 +207,7 @@ def main(args):
     stats = {"sum_equal": 0.0, "sum_zero": 0.0, "count": 0}
     for batch in DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=focus_fusion_collate):
         conditions = [x.to(device, dtype=dtype) for x in batch["conditions"]]
+        args.expected_output_hw = conditions[0].shape[-2:]
         focus_maps = [x.to(device, dtype=dtype) for x in batch["focus_maps"]]
         prompt = embeds(batch["prompt"])
         base_latents = prepare_condition_latents(model, conditions, args.vae_encode_mode)
@@ -181,14 +226,25 @@ def main(args):
                 final = keep_mask * conditions[0] + (1 - keep_mask) * raw
             idx = int(batch["metadata_index"].item()); folder = out_root / f"{idx:06d}"; folder.mkdir(exist_ok=True)
             images = {"pred_raw.png": _pil(raw), "final.png": _pil(final), "GT.png": _pil(batch["gt"])}
+            used_conditions, used_focus_maps, ablation_meta = build_ablation_debug_inputs(args.input_mode, mode, conditions, focus_maps)
             for i, cond in enumerate(conditions):
-                images[f"{chr(ord('A') + i)}.png"] = _pil(cond)
-            for i, fmap in enumerate(save_focus_maps):
-                images[f"focus_{i}.png"] = _pil(fmap, True)
+                images[f"{chr(ord('A') + i)}_original.png"] = _pil(cond)
+            for i, cond in enumerate(used_conditions):
+                suffix = "_used_latent_zero_proxy.png" if mode == "refs_zero" and i > 0 else "_used.png"
+                images[f"{chr(ord('A') + i)}{suffix}"] = _pil(cond)
+                if i == 0:
+                    images["A.png"] = _pil(cond)
+            for i, fmap in enumerate(focus_maps):
+                images[f"focus_{i}_original.png"] = _pil(fmap, True)
+            for i, fmap in enumerate(used_focus_maps):
+                images[f"focus_{i}_used.png"] = _pil(fmap, True)
             if args.keep_a_composite:
                 images["pred_keepa_composite.png"] = _pil(final)
             for name, image in images.items(): image.save(folder / name)
-            panel_names = [f"{chr(ord('A') + i)}.png" for i in range(len(conditions))] + ["GT.png"] + [f"focus_{i}.png" for i in range(len(save_focus_maps))] + ["pred_raw.png"]
+            with open(folder / "ablation.json", "w", encoding="utf-8") as handle:
+                json.dump(ablation_meta, handle, indent=2, sort_keys=True)
+            panel_names = [f"{chr(ord('A') + i)}{'_used_latent_zero_proxy.png' if mode == 'refs_zero' and i > 0 else '_used.png'}" for i in range(len(used_conditions))]
+            panel_names += ["GT.png"] + [f"focus_{i}_used.png" for i in range(len(used_focus_maps))] + ["pred_raw.png"]
             if args.keep_a_composite:
                 panel_names.append("pred_keepa_composite.png")
             panels = [images[n].convert("RGB") for n in panel_names]

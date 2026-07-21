@@ -294,6 +294,26 @@ def load_verified_checkpoint(checkpoint_path):
     return verified
 
 
+def resolve_prompt_embedding(*, checkpoint_state, checkpoint_config, pretrained_model_name_or_path,
+                             prompt_text=None, batch_size=1, device=None, dtype=None):
+    cached = checkpoint_state.get("fixed_prompt_embedding")
+    if cached is not None and hasattr(cached, "numel") and cached.numel():
+        emb = cached.to(device=device, dtype=dtype).expand(batch_size, -1, -1)
+        return {"embedding": emb, "source": "checkpoint_cache", "tokenizer": None, "text_encoder": None}
+    text = prompt_text or checkpoint_state.get("fixed_prompt") or checkpoint_config.get("fixed_prompt")
+    if not text:
+        raise RuntimeError("fixed prompt embedding is absent and fixed prompt text is missing")
+    from transformers import AutoTokenizer, CLIPTextModel
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(pretrained_model_name_or_path, subfolder="text_encoder")
+    text_encoder.to(device=device, dtype=dtype).eval()
+    ids = tokenizer([text] * batch_size, max_length=tokenizer.model_max_length, padding="max_length",
+                    truncation=True, return_tensors="pt").input_ids.to(device)
+    with torch.no_grad():
+        emb = text_encoder(ids)[0]
+    return {"embedding": emb, "source": "text_encoder", "tokenizer": tokenizer, "text_encoder": text_encoder}
+
+
 def write_checkpoint_complete_manifest(checkpoint_path, payload):
     import json
 
@@ -424,11 +444,11 @@ class FocusFusionGenerator(nn.Module):
         assert output.shape[1] == 3
         return output, denoised, pred
 
-    def forward_from_latents(self, latents, focus_a=None, focus_b=None, prompt_embeds=None,
-                             tiled=False, tile_size=96, tile_overlap=32):
+    def forward_from_latents(self, latents, focus_a=None, focus_b=None, prompt_embeds=None, *,
+                             expected_output_hw, tiled=False, tile_size=96, tile_overlap=32):
         pred = self.predict_noise_from_latents(latents, focus_a, focus_b, prompt_embeds, tiled, tile_size, tile_overlap)
         denoised = self.scheduler_step_from_prediction(pred, latents[0])
-        output = self.decode_latents(denoised, reference_image=latents[0])
+        output = self.decode_latents(denoised, expected_output_hw=expected_output_hw)
         return output, denoised, pred
 
     def predict_noise_from_latents(self, latents, focus_a=None, focus_b=None, prompt_embeds=None,
@@ -446,11 +466,16 @@ class FocusFusionGenerator(nn.Module):
         ts = self.timesteps.to(z_a.device)
         return self.scheduler.step(model_pred, ts, z_a, return_dict=True).prev_sample
 
-    def decode_latents(self, latents, reference_image=None):
+    def decode_latents(self, latents, *, expected_output_hw):
         output = self.vae.decode(latents / self.vae.config.scaling_factor).sample.clamp(-1, 1)
-        if reference_image is not None and hasattr(reference_image, "shape") and output.shape[-2:] == reference_image.shape[-2:]:
-            pass
-        assert output.shape[1] == 3
+        if output.shape[1] != 3:
+            raise RuntimeError(f"decoded output channel mismatch: expected=3, actual={output.shape[1]}")
+        if tuple(output.shape[-2:]) != tuple(expected_output_hw):
+            raise RuntimeError(
+                "decoded output size mismatch: "
+                f"expected={tuple(expected_output_hw)}, actual={tuple(output.shape[-2:])}, "
+                f"latent={tuple(latents.shape[-2:])}, vae_scale_factor={vae_scale_factor(self.vae)}, input_mode={self.input_mode}"
+            )
         return output
 
 

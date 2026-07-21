@@ -10,7 +10,8 @@ import torch
 
 from osediff_focus_fusion import (FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint,
                                   move_scheduler_to_device, normalize_input_mode, read_focus_checkpoint_config,
-                                  load_vae_lora_state, get_generator_in_channels, load_verified_checkpoint)
+                                  load_vae_lora_state, get_generator_in_channels, load_verified_checkpoint,
+                                  resolve_prompt_embedding)
 from test_osediff_focus_fusion import prepare_condition_latents
 
 
@@ -108,12 +109,17 @@ def run_real(args, device):
         focus_maps = [torch.rand(1, 1, args.height, args.width, device=device, dtype=dtype) for _ in range(2)]
     _sync(device)
     preprocess_time = time.perf_counter() - prep_start
-    prompt = model.fixed_prompt_embedding
-    prompt_source = "checkpoint_cached_fixed_prompt"
-    if not prompt.numel():
-        raise RuntimeError("fixed prompt embedding is absent; benchmark must compute a real embedding before timing, not use zeros")
-    prompt = prompt.to(device=device, dtype=dtype)
-    print(f"prompt_embedding_source: {prompt_source}")
+    resolved_prompt = resolve_prompt_embedding(
+        checkpoint_state=state,
+        checkpoint_config=ckpt,
+        pretrained_model_name_or_path=args.pretrained_model_name_or_path,
+        prompt_text=ckpt.get("fixed_prompt"),
+        batch_size=1,
+        device=device,
+        dtype=dtype,
+    )
+    prompt = resolved_prompt["embedding"]
+    print(f"prompt_embedding_source: {resolved_prompt['source']}")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     phase = {"image_load_preprocess": 0.0, "vae_encode": 0.0, "unet_one_step": 0.0, "scheduler_step": 0.0, "vae_decode": 0.0, "end_to_end": 0.0}
@@ -129,7 +135,7 @@ def run_real(args, device):
             pred = model.predict_noise_from_latents(latents, fa, fb, prompt, args.tiled, args.latent_tiled_size, args.latent_tiled_overlap)
             _sync(device); e2 = time.perf_counter()
             s3 = time.perf_counter(); den = model.scheduler_step_from_prediction(pred, latents[0]); _sync(device); e3 = time.perf_counter()
-            s4 = time.perf_counter(); model.decode_latents(den); _sync(device); e4 = time.perf_counter()
+            s4 = time.perf_counter(); model.decode_latents(den, expected_output_hw=(args.height, args.width)); _sync(device); e4 = time.perf_counter()
         t1 = time.perf_counter()
         if i >= args.warmup_iterations:
             phase["vae_encode"] += e - s

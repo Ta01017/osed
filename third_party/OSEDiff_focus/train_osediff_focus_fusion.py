@@ -2,6 +2,7 @@
 import argparse
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -153,6 +154,16 @@ def validate_optimizer_manifest(saved, current):
 RESUME_ALLOWED_CLI_OVERRIDES = {"max_train_steps", "validation_steps", "checkpointing_steps", "output_dir"}
 
 
+@dataclass
+class TrainingProgress:
+    global_step: int
+    current_epoch: int
+    batches_consumed_in_current_epoch: int
+    micro_batches: int = 0
+    optimizer_updates: int = 0
+    scheduler_steps: int = 0
+
+
 def validate_resume_config(args, resume_cfg):
     """Validate structural resume fields and copy checkpoint-owned structure onto args."""
     if not resume_cfg:
@@ -220,23 +231,85 @@ def build_train_sampler(dataset, accelerator, args, epoch=0):
     return sampler
 
 
+def _resume_mismatch(field, checkpoint_value, current_value):
+    raise ValueError(
+        "[RESUME CONFIG MISMATCH] "
+        f"field={field}, checkpoint={checkpoint_value!r}, command_line={current_value!r}"
+    )
+
+
+def validate_sampler_resume_state(trainer_state, *, dataset_length, world_size, train_batch_size,
+                                  gradient_accumulation_steps, sampler_seed, drop_last, dataloader_length=None):
+    if not trainer_state:
+        return
+    checks = {
+        "dataset_length": dataset_length,
+        "world_size": world_size,
+        "train_batch_size": train_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "sampler_seed": sampler_seed,
+        "drop_last": drop_last,
+    }
+    for field, current in checks.items():
+        if trainer_state.get(field) != current:
+            _resume_mismatch(field, trainer_state.get(field), current)
+    sampler_epoch = int(trainer_state.get("sampler_epoch", -1))
+    batch_pos = int(trainer_state.get("batches_consumed_in_current_epoch", -1))
+    if sampler_epoch < 0:
+        _resume_mismatch("sampler_epoch", sampler_epoch, ">=0")
+    if batch_pos < 0:
+        _resume_mismatch("batches_consumed_in_current_epoch", batch_pos, ">=0")
+    if dataloader_length is not None and batch_pos > dataloader_length:
+        _resume_mismatch("batches_consumed_in_current_epoch", batch_pos, f"<= {dataloader_length}")
+
+
+def broadcast_checkpoint_temp_dir(accelerator, temp_dir_on_main, final_dir):
+    final_dir = Path(final_dir)
+    if accelerator.num_processes == 1:
+        temp_dir = Path(temp_dir_on_main)
+    else:
+        import torch.distributed as dist
+        payload = [str(temp_dir_on_main) if accelerator.is_main_process else None]
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError("distributed temp_dir broadcast requires initialized torch.distributed")
+        dist.broadcast_object_list(payload, src=0)
+        if not payload[0]:
+            raise RuntimeError("checkpoint temp_dir broadcast returned an empty path")
+        temp_dir = Path(payload[0])
+    expected_prefix = f".{final_dir.name}.tmp-"
+    if not temp_dir.name.startswith(expected_prefix):
+        raise RuntimeError(f"broadcast temp_dir name mismatch: expected prefix={expected_prefix}, actual={temp_dir.name}")
+    if temp_dir.parent.resolve() != final_dir.parent.resolve():
+        raise RuntimeError(f"broadcast temp_dir parent mismatch: expected={final_dir.parent}, actual={temp_dir.parent}")
+    if not temp_dir.is_dir():
+        raise RuntimeError(f"broadcast temp_dir does not exist: {temp_dir}")
+    return temp_dir
+
+
 def run_training_loop(*, accelerator, model, train_dataloader, optimizer, lr_scheduler,
                       max_train_steps, global_step=0, checkpointing_steps=0,
                       validation_steps=0, compute_loss_fn=None, checkpoint_fn=None,
-                      validation_fn=None, max_grad_norm=None, current_epoch=0,
+                      validation_fn=None, logging_fn=None, logging_steps=10,
+                      max_grad_norm=None, current_epoch=0,
                       batches_consumed_in_current_epoch=0, train_sampler=None):
     """Shared optimizer-update loop used by formal training tests and main-like code."""
     optimizer.zero_grad(set_to_none=True)
-    forward_micro_batches = backward_calls = optimizer_steps = scheduler_steps = 0
-    while global_step < max_train_steps:
+    progress = TrainingProgress(int(global_step), int(current_epoch), int(batches_consumed_in_current_epoch))
+    backward_calls = 0
+    while progress.global_step < max_train_steps:
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
-            train_sampler.set_epoch(current_epoch)
+            train_sampler.set_epoch(progress.current_epoch)
+        epoch_exhausted = True
         for batch_index, batch in enumerate(train_dataloader):
-            if batch_index < batches_consumed_in_current_epoch:
+            if batch_index < progress.batches_consumed_in_current_epoch:
                 continue
             with accelerator.accumulate(model):
-                loss = compute_loss_fn(model, batch) if compute_loss_fn else model(batch)
-                forward_micro_batches += 1
+                result = compute_loss_fn(model, batch) if compute_loss_fn else model(batch)
+                if isinstance(result, tuple):
+                    loss, losses = result
+                else:
+                    loss, losses = result, {}
+                progress.micro_batches += 1
                 accelerator.backward(loss)
                 backward_calls += 1
                 if accelerator.sync_gradients:
@@ -245,27 +318,25 @@ def run_training_loop(*, accelerator, model, train_dataloader, optimizer, lr_sch
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-                    optimizer_steps += 1
-                    scheduler_steps += 1
-                    global_step += 1
-            batches_consumed_in_current_epoch = batch_index + 1
+                    progress.optimizer_updates += 1
+                    progress.scheduler_steps += 1
+                    progress.global_step += 1
+            progress.batches_consumed_in_current_epoch = batch_index + 1
             if accelerator.sync_gradients:
-                if validation_steps and global_step % validation_steps == 0 and validation_fn:
-                    validation_fn(global_step)
-                if checkpointing_steps and global_step % checkpointing_steps == 0 and checkpoint_fn:
-                    checkpoint_fn(global_step)
-            if global_step >= max_train_steps:
+                if logging_fn and (progress.global_step == 1 or (logging_steps and progress.global_step % logging_steps == 0)):
+                    logging_fn(progress, losses)
+                if validation_steps and progress.global_step % validation_steps == 0 and validation_fn:
+                    validation_fn(progress)
+                if checkpointing_steps and progress.global_step % checkpointing_steps == 0 and checkpoint_fn:
+                    checkpoint_fn(progress, losses)
+            if progress.global_step >= max_train_steps:
+                epoch_exhausted = False
                 break
-        current_epoch += 1
-        batches_consumed_in_current_epoch = 0
-    return {
-        "global_step": global_step,
-        "current_epoch": current_epoch,
-        "forward_micro_batches": forward_micro_batches,
-        "backward_calls": backward_calls,
-        "optimizer_steps": optimizer_steps,
-        "scheduler_steps": scheduler_steps,
-    }
+        if epoch_exhausted:
+            progress.current_epoch += 1
+            progress.batches_consumed_in_current_epoch = 0
+    progress.backward_calls = backward_calls
+    return progress
 
 
 def _groups(model, args, vsd=None):
@@ -532,123 +603,122 @@ def main(args):
     start = resume_progress["global_step"]
     completed_epochs = resume_progress["completed_epochs"]
     resume_micro_steps = resume_progress["micro_steps_in_current_epoch"]
-    global_step = int(start)
-    optimizer.zero_grad(set_to_none=True)
-    while global_step < args.max_train_steps:
-        if hasattr(train_sampler, "set_epoch"):
-            train_sampler.set_epoch(completed_epochs)
-        micro_steps_in_current_epoch = 0
-        for batch_idx, batch in enumerate(loader):
-            if resume_micro_steps and batch_idx < resume_micro_steps:
-                continue
-            resume_micro_steps = 0
-            micro_steps_in_current_epoch = batch_idx + 1
-            with accelerator.accumulate(model):
-                prompts = batch["prompt"]
-                if args.prompt_mode == "ram":
-                    x = ram_tf(batch["gt"].mul(0.5).add(0.5)).to(accelerator.device, dtype=torch.float16)
-                    prompts = [str(x) for x in ram_infer(x, ram_model)]
-                raw = accelerator.unwrap_model(model)
-                if args.prompt_mode == "fixed" and raw.fixed_prompt_embedding.numel():
-                    emb = raw.fixed_prompt_embedding.to(accelerator.device).expand(len(prompts), -1, -1)
-                else:
-                    emb = encode(prompts, accelerator.device)
-                conditions = [x.to(accelerator.device) for x in batch["conditions"]]
-                focus_maps = [x.to(accelerator.device) for x in batch["focus_maps"]]
-                fa = focus_maps[0] if focus_maps else None
-                fb = focus_maps[1] if len(focus_maps) > 1 else None
-                pred, latent, _ = model(conditions, fa, fb, emb, "sample")
-                gt, a = batch["gt"].to(accelerator.device), conditions[0]
-                losses = {"l2": F.mse_loss(pred.float(), gt.float()) * args.lambda_l2,
-                          "gradient": gradient_loss(pred.float(), gt.float()) * args.lambda_gradient,
-                          "laplacian": laplacian_loss(pred.float(), gt.float()) * args.lambda_laplacian}
-                if args.input_mode == "ab_focus":
-                    keep, bref = fa.clamp(0, 1), ((1 - fa) * fb).clamp(0, 1)
-                    losses["keep"] = masked_l1(pred.float(), a.float(), keep.float()) * args.lambda_keep
-                    losses["bref"] = masked_l1(pred.float(), gt.float(), bref.float()) * args.lambda_bref
-                if args.lambda_lpips:
-                    import lpips
-                    if not hasattr(main, "lpips_net"):
-                        main.lpips_net = lpips.LPIPS(net="vgg").to(accelerator.device).requires_grad_(False)
-                    losses["lpips"] = main.lpips_net(pred.float(), gt.float()).mean() * args.lambda_lpips
-                if model_reg is not None and args.lambda_vsd:
-                    neg_emb = encode([""] * len(prompts), accelerator.device)
-                    reg = model_reg.module if hasattr(model_reg, "module") else model_reg
-                    losses["vsd"] = reg.distribution_matching_loss(latent, emb, neg_emb, args) * args.lambda_vsd
-                if model_reg is not None and args.lambda_vsd_lora:
-                    reg = model_reg.module if hasattr(model_reg, "module") else model_reg
-                    losses["vsd_lora"] = reg.diff_loss(latent, emb, args) * args.lambda_vsd_lora
-                loss = sum(losses.values())
-                if not torch.isfinite(loss):
-                    print("non-finite loss components:", {k: float(v.detach().float().cpu()) for k, v in losses.items()})
-                    print("metadata_index:", batch["metadata_index"])
-                    raise RuntimeError("NaN/Inf loss detected")
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], args.max_grad_norm)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    global_step += 1
-            if accelerator.sync_gradients:
-                if accelerator.is_main_process and (global_step == 1 or global_step % 10 == 0):
-                    log_losses = {k: round(v.item(), 6) for k, v in losses.items()}
-                    if args.input_mode != "ab_focus":
-                        log_losses["keep"] = "disabled"; log_losses["bref"] = "disabled"
-                    print(global_step, log_losses)
-                if args.validation_steps > 0 and global_step % args.validation_steps == 0:
-                    accelerator.wait_for_everyone()
-                    run_validation(model, val_loader, encode, args, accelerator, global_step)
-                    accelerator.wait_for_everyone()
-                if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
-                    accelerator.wait_for_everyone()
-                    checkpoint_dir = Path(args.output_dir, "checkpoints", f"checkpoint-{global_step:08d}")
-                    temp_dir = prepare_checkpoint_temp_dir(checkpoint_dir) if accelerator.is_main_process else None
-                    accelerator.wait_for_everyone()
-                    if not accelerator.is_main_process:
-                        # Main process created the temp dir; all ranks use the same deterministic newest temp path.
-                        candidates = sorted(checkpoint_dir.parent.glob(f".{checkpoint_dir.name}.tmp-*"), key=lambda p: p.stat().st_mtime)
-                        if not candidates:
-                            raise RuntimeError(f"checkpoint temp dir not found for rank {accelerator.process_index}: {checkpoint_dir}")
-                        temp_dir = candidates[-1]
-                    accelerator_state_dir = temp_dir / "accelerator_state"
-                    accelerator_state_dir.mkdir(parents=True, exist_ok=True)
-                    accelerator.save_state(str(accelerator_state_dir))
-                    accelerator.wait_for_everyone()
-                if accelerator.is_main_process and args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
-                    raw = accelerator.unwrap_model(model)
-                    raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
-                    payload = checkpoint_payload(
-                        raw, global_step, args, None, None, raw_reg, accelerator,
-                        optimizer_group_manifest=current_manifest,
-                        completed_epochs=completed_epochs,
-                        micro_steps_in_current_epoch=micro_steps_in_current_epoch,
-                        dataloader_position=micro_steps_in_current_epoch,
-                        sampler_epoch=completed_epochs,
-                    )
-                    trainer_state = {
-                        "global_step": global_step,
-                        "current_epoch": completed_epochs,
-                        "completed_epochs": completed_epochs,
-                        "batches_consumed_in_current_epoch": micro_steps_in_current_epoch,
-                        "sampler_seed": args.seed,
-                        "sampler_epoch": completed_epochs,
-                        "dataset_length": len(dataset),
-                        "world_size": accelerator.num_processes,
-                        "process_count": accelerator.num_processes,
-                        "train_batch_size": args.train_batch_size,
-                        "gradient_accumulation_steps": args.gradient_accumulation_steps,
-                        "drop_last": False,
-                    }
-                    torch.save(payload, temp_dir / "model_state.pt")
-                    write_json_atomically(temp_dir / "trainer_state.json", trainer_state)
-                    write_json_atomically(temp_dir / "optimizer_manifest.json", current_manifest)
-                    finalize_checkpoint_directory(temp_dir, checkpoint_dir, payload, trainer_state, current_manifest)
-                if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
-                    accelerator.wait_for_everyone()
-                if global_step >= args.max_train_steps:
-                    break
-        completed_epochs += 1
+    def compute_loss_callback(train_model, batch):
+        prompts = batch["prompt"]
+        if args.prompt_mode == "ram":
+            x = ram_tf(batch["gt"].mul(0.5).add(0.5)).to(accelerator.device, dtype=torch.float16)
+            prompts = [str(x) for x in ram_infer(x, ram_model)]
+        raw = accelerator.unwrap_model(train_model)
+        if args.prompt_mode == "fixed" and raw.fixed_prompt_embedding.numel():
+            emb = raw.fixed_prompt_embedding.to(accelerator.device).expand(len(prompts), -1, -1)
+        else:
+            emb = encode(prompts, accelerator.device)
+        conditions = [x.to(accelerator.device) for x in batch["conditions"]]
+        focus_maps = [x.to(accelerator.device) for x in batch["focus_maps"]]
+        fa = focus_maps[0] if focus_maps else None
+        fb = focus_maps[1] if len(focus_maps) > 1 else None
+        pred, latent, _ = train_model(conditions, fa, fb, emb, "sample")
+        gt, a = batch["gt"].to(accelerator.device), conditions[0]
+        losses = {"l2": F.mse_loss(pred.float(), gt.float()) * args.lambda_l2,
+                  "gradient": gradient_loss(pred.float(), gt.float()) * args.lambda_gradient,
+                  "laplacian": laplacian_loss(pred.float(), gt.float()) * args.lambda_laplacian}
+        if args.input_mode == "ab_focus":
+            keep, bref = fa.clamp(0, 1), ((1 - fa) * fb).clamp(0, 1)
+            losses["keep"] = masked_l1(pred.float(), a.float(), keep.float()) * args.lambda_keep
+            losses["bref"] = masked_l1(pred.float(), gt.float(), bref.float()) * args.lambda_bref
+        if args.lambda_lpips:
+            import lpips
+            if not hasattr(main, "lpips_net"):
+                main.lpips_net = lpips.LPIPS(net="vgg").to(accelerator.device).requires_grad_(False)
+            losses["lpips"] = main.lpips_net(pred.float(), gt.float()).mean() * args.lambda_lpips
+        if model_reg is not None and args.lambda_vsd:
+            neg_emb = encode([""] * len(prompts), accelerator.device)
+            reg = model_reg.module if hasattr(model_reg, "module") else model_reg
+            losses["vsd"] = reg.distribution_matching_loss(latent, emb, neg_emb, args) * args.lambda_vsd
+        if model_reg is not None and args.lambda_vsd_lora:
+            reg = model_reg.module if hasattr(model_reg, "module") else model_reg
+            losses["vsd_lora"] = reg.diff_loss(latent, emb, args) * args.lambda_vsd_lora
+        loss = sum(losses.values())
+        if not torch.isfinite(loss):
+            print("non-finite loss components:", {k: float(v.detach().float().cpu()) for k, v in losses.items()})
+            print("metadata_index:", batch["metadata_index"])
+            raise RuntimeError("NaN/Inf loss detected")
+        return loss, losses
+
+    def logging_callback(progress, losses):
+        if accelerator.is_main_process:
+            log_losses = {k: round(v.item(), 6) for k, v in losses.items()}
+            if args.input_mode != "ab_focus":
+                log_losses["keep"] = "disabled"; log_losses["bref"] = "disabled"
+            print(progress.global_step, log_losses)
+
+    def validation_callback(progress):
+        accelerator.wait_for_everyone()
+        run_validation(model, val_loader, encode, args, accelerator, progress.global_step)
+        accelerator.wait_for_everyone()
+
+    def checkpoint_callback(progress, losses):
+        del losses
+        accelerator.wait_for_everyone()
+        checkpoint_dir = Path(args.output_dir, "checkpoints", f"checkpoint-{progress.global_step:08d}")
+        temp_on_main = prepare_checkpoint_temp_dir(checkpoint_dir) if accelerator.is_main_process else None
+        temp_dir = broadcast_checkpoint_temp_dir(accelerator, temp_on_main, checkpoint_dir)
+        accelerator.wait_for_everyone()
+        accelerator_state_dir = temp_dir / "accelerator_state"
+        accelerator_state_dir.mkdir(parents=True, exist_ok=True)
+        accelerator.save_state(str(accelerator_state_dir))
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            raw = accelerator.unwrap_model(model)
+            raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
+            payload = checkpoint_payload(
+                raw, progress.global_step, args, None, None, raw_reg, accelerator,
+                optimizer_group_manifest=current_manifest,
+                completed_epochs=progress.current_epoch,
+                micro_steps_in_current_epoch=progress.batches_consumed_in_current_epoch,
+                dataloader_position=progress.batches_consumed_in_current_epoch,
+                sampler_epoch=progress.current_epoch,
+            )
+            trainer_state = {
+                "global_step": progress.global_step,
+                "current_epoch": progress.current_epoch,
+                "completed_epochs": progress.current_epoch,
+                "batches_consumed_in_current_epoch": progress.batches_consumed_in_current_epoch,
+                "sampler_seed": args.seed,
+                "sampler_epoch": progress.current_epoch,
+                "dataset_length": len(dataset),
+                "world_size": accelerator.num_processes,
+                "process_count": accelerator.num_processes,
+                "train_batch_size": args.train_batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "drop_last": False,
+            }
+            torch.save(payload, temp_dir / "model_state.pt")
+            write_json_atomically(temp_dir / "trainer_state.json", trainer_state)
+            write_json_atomically(temp_dir / "optimizer_manifest.json", current_manifest)
+            finalize_checkpoint_directory(temp_dir, checkpoint_dir, payload, trainer_state, current_manifest)
+        accelerator.wait_for_everyone()
+
+    run_training_loop(
+        accelerator=accelerator,
+        model=model,
+        train_dataloader=loader,
+        train_sampler=train_sampler,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        max_train_steps=args.max_train_steps,
+        global_step=resume_progress["global_step"],
+        current_epoch=resume_progress["completed_epochs"],
+        batches_consumed_in_current_epoch=resume_progress["micro_steps_in_current_epoch"],
+        compute_loss_fn=compute_loss_callback,
+        checkpoint_fn=checkpoint_callback,
+        validation_fn=validation_callback,
+        logging_fn=logging_callback,
+        checkpointing_steps=args.checkpointing_steps,
+        validation_steps=args.validation_steps,
+        logging_steps=10,
+        max_grad_norm=args.max_grad_norm,
+    )
 
 
 if __name__ == "__main__": main(parse_args())
