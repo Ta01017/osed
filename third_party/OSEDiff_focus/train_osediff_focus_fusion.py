@@ -168,12 +168,61 @@ RESUME_ALLOWED_CLI_OVERRIDES = {"max_train_steps", "validation_steps", "checkpoi
 
 @dataclass
 class TrainingProgress:
-    global_step: int
-    current_epoch: int
-    batches_consumed_in_current_epoch: int
+    global_step: int = 0
+    current_epoch: int = 0
+    completed_epochs: int = 0
+    batches_consumed_in_current_epoch: int = 0
     micro_batches: int = 0
     optimizer_updates: int = 0
     scheduler_steps: int = 0
+    sampler_epoch: int = 0
+
+    @classmethod
+    def from_trainer_state(cls, trainer_state):
+        if not trainer_state:
+            return cls()
+        return cls(
+            global_step=int(trainer_state["global_step"]),
+            current_epoch=int(trainer_state.get("current_epoch", 0)),
+            completed_epochs=int(trainer_state.get("completed_epochs", 0)),
+            batches_consumed_in_current_epoch=int(trainer_state["batches_consumed_in_current_epoch"]),
+            micro_batches=int(trainer_state.get("micro_batches", 0)),
+            optimizer_updates=int(trainer_state.get("optimizer_updates", trainer_state["global_step"])),
+            scheduler_steps=int(trainer_state.get("scheduler_steps", trainer_state["global_step"])),
+            sampler_epoch=int(trainer_state.get("sampler_epoch", trainer_state.get("current_epoch", 0))),
+        )
+
+    def to_trainer_state_fields(self):
+        return {
+            "global_step": int(self.global_step),
+            "current_epoch": int(self.current_epoch),
+            "completed_epochs": int(self.completed_epochs),
+            "batches_consumed_in_current_epoch": int(self.batches_consumed_in_current_epoch),
+            "micro_batches": int(self.micro_batches),
+            "optimizer_updates": int(self.optimizer_updates),
+            "scheduler_steps": int(self.scheduler_steps),
+            "sampler_epoch": int(self.sampler_epoch),
+        }
+
+
+def validate_training_progress(progress: TrainingProgress, *, gradient_accumulation_steps, dataloader_length=None):
+    fields = ("global_step", "current_epoch", "completed_epochs", "sampler_epoch",
+              "batches_consumed_in_current_epoch", "micro_batches", "optimizer_updates", "scheduler_steps")
+    for field in fields:
+        if getattr(progress, field) < 0:
+            raise ValueError(f"[INVALID TRAINING PROGRESS] {field} must be >= 0, got {getattr(progress, field)}")
+    if progress.optimizer_updates != progress.global_step:
+        raise ValueError(f"[INVALID TRAINING PROGRESS] optimizer_updates={progress.optimizer_updates} global_step={progress.global_step}")
+    if progress.scheduler_steps != progress.global_step:
+        raise ValueError(f"[INVALID TRAINING PROGRESS] scheduler_steps={progress.scheduler_steps} global_step={progress.global_step}")
+    if progress.micro_batches < progress.optimizer_updates:
+        raise ValueError(f"[INVALID TRAINING PROGRESS] micro_batches={progress.micro_batches} optimizer_updates={progress.optimizer_updates}")
+    if progress.completed_epochs > progress.current_epoch:
+        raise ValueError(f"[INVALID TRAINING PROGRESS] completed_epochs={progress.completed_epochs} current_epoch={progress.current_epoch}")
+    if progress.sampler_epoch != progress.current_epoch:
+        raise ValueError(f"[INVALID TRAINING PROGRESS] sampler_epoch={progress.sampler_epoch} current_epoch={progress.current_epoch}")
+    if dataloader_length is not None and progress.batches_consumed_in_current_epoch > dataloader_length:
+        raise ValueError(f"[INVALID TRAINING PROGRESS] batches_consumed_in_current_epoch={progress.batches_consumed_in_current_epoch} dataloader_length={dataloader_length}")
 
 
 def validate_resume_config(args, resume_cfg):
@@ -228,6 +277,7 @@ def resume_training_from_checkpoint(*, trainer_state, optimizer=None, lr_schedul
     print(f"[RESUME] micro_steps_in_current_epoch {progress['micro_steps_in_current_epoch']}")
     print(f"[RESUME] dataloader batches skipped {progress['micro_steps_in_current_epoch']}")
     print("[RESUME] sampler position restored")
+    print("[RESUME] trainer state restored")
     return progress
 
 
@@ -256,6 +306,13 @@ def normalize_path_for_resume(path):
     return None if path is None else str(Path(path).expanduser().resolve())
 
 
+def normalize_model_identifier(value):
+    if value is None:
+        return None
+    candidate = Path(value).expanduser()
+    return str(candidate.resolve()) if candidate.exists() else str(value).strip()
+
+
 RESUME_CONFIG_FIELDS = {
     "pretrained_model_name_or_path", "input_mode", "generator_in_channels", "lora_rank_unet",
     "lora_rank_vae", "lora_rank_vsd", "train_conv_in", "train_vae_lora", "use_vsd",
@@ -265,16 +322,19 @@ RESUME_CONFIG_FIELDS = {
     "start_index", "max_samples", "dataset_length", "train_batch_size",
     "gradient_accumulation_steps", "world_size", "seed", "sampler_seed", "drop_last",
     "random_flip", "mixed_precision", "learning_rate", "weight_decay", "lr_scheduler",
-    "lr_warmup_steps", "max_pixels", "native_resolution", "strict_native_size", "lambda_l2",
+    "lr_warmup_steps", "lr_num_cycles", "lr_power", "max_grad_norm", "cfg_vsd",
+    "keep_threshold", "keep_soft_width", "max_pixels", "native_resolution", "strict_native_size", "lambda_l2",
     "lambda_lpips", "lambda_vsd", "lambda_vsd_lora", "lambda_keep", "lambda_bref",
     "lambda_gradient", "lambda_laplacian",
 }
 RESUME_OVERRIDE_FIELDS = {"max_train_steps", "checkpointing_steps", "validation_steps", "validation_max_samples", "logging_steps", "output_dir"}
+RESUME_INVARIANT_FIELDS = RESUME_CONFIG_FIELDS
+NON_TRAINING_FIELDS = {"resume_from_checkpoint", "ram_path", "ram_ft_path", "smoke", "resolution", "random_crop", "center_crop", "dataloader_num_workers", "lora_rank"}
 
 
 def build_resume_config_snapshot(args, *, model, accelerator, dataset_length):
     return {
-        "pretrained_model_name_or_path": normalize_path_for_resume(args.pretrained_model_name_or_path),
+        "pretrained_model_name_or_path": normalize_model_identifier(args.pretrained_model_name_or_path),
         "input_mode": normalize_input_mode(args.input_mode),
         "generator_in_channels": int(model.unet.conv_in.in_channels),
         "lora_rank_unet": int(args.lora_rank_unet),
@@ -310,6 +370,12 @@ def build_resume_config_snapshot(args, *, model, accelerator, dataset_length):
         "weight_decay": float(getattr(args, "weight_decay", 0.01)),
         "lr_scheduler": args.lr_scheduler,
         "lr_warmup_steps": int(args.lr_warmup_steps),
+        "lr_num_cycles": int(args.lr_num_cycles),
+        "lr_power": float(args.lr_power),
+        "max_grad_norm": float(args.max_grad_norm),
+        "cfg_vsd": float(args.cfg_vsd),
+        "keep_threshold": float(args.keep_threshold),
+        "keep_soft_width": float(args.keep_soft_width),
         "max_pixels": args.max_pixels,
         "native_resolution": bool(args.native_resolution),
         "strict_native_size": bool(args.strict_native_size),
@@ -354,8 +420,8 @@ def validate_sampler_resume_state(trainer_state, *, dataset_length, world_size, 
                                   gradient_accumulation_steps, sampler_seed, drop_last, dataloader_length=None):
     if not trainer_state:
         return
-    if int(trainer_state.get("trainer_state_version", 2)) != 2:
-        _resume_mismatch("trainer_state_version", trainer_state.get("trainer_state_version"), 2)
+    if int(trainer_state.get("trainer_state_version", 3)) not in (2, 3):
+        _resume_mismatch("trainer_state_version", trainer_state.get("trainer_state_version"), "2 or 3")
     checks = {
         "dataset_length": dataset_length,
         "world_size": world_size,
@@ -414,19 +480,17 @@ def broadcast_checkpoint_temp_dir(accelerator, temp_dir_on_main, final_dir):
     return temp_dir
 
 
-def run_training_loop(*, accelerator, model, train_dataloader, optimizer, lr_scheduler,
-                      max_train_steps, global_step=0, checkpointing_steps=0,
+def run_training_loop(*, accelerator, model, train_dataloader, train_sampler, optimizer, lr_scheduler,
+                      progress: TrainingProgress, max_train_steps, checkpointing_steps=0,
                       validation_steps=0, compute_loss_fn=None, checkpoint_fn=None,
                       validation_fn=None, logging_fn=None, logging_steps=10,
-                      max_grad_norm=None, current_epoch=0,
-                      batches_consumed_in_current_epoch=0, train_sampler=None):
+                      max_grad_norm=None):
     """Shared optimizer-update loop used by formal training tests and main-like code."""
     optimizer.zero_grad(set_to_none=True)
-    progress = TrainingProgress(int(global_step), int(current_epoch), int(batches_consumed_in_current_epoch))
-    backward_calls = 0
+    validate_training_progress(progress, gradient_accumulation_steps=getattr(accelerator, "accumulation", 1), dataloader_length=len(train_dataloader) if hasattr(train_dataloader, "__len__") else None)
     while progress.global_step < max_train_steps:
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
-            train_sampler.set_epoch(progress.current_epoch)
+            train_sampler.set_epoch(progress.sampler_epoch)
         epoch_exhausted = True
         for batch_index, batch in enumerate(train_dataloader):
             if batch_index < progress.batches_consumed_in_current_epoch:
@@ -439,16 +503,15 @@ def run_training_loop(*, accelerator, model, train_dataloader, optimizer, lr_sch
                     loss, losses = result, {}
                 progress.micro_batches += 1
                 accelerator.backward(loss)
-                backward_calls += 1
                 if accelerator.sync_gradients:
                     if max_grad_norm is not None:
                         accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                     optimizer.step()
-                    lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     progress.optimizer_updates += 1
-                    progress.scheduler_steps += 1
                     progress.global_step += 1
+                    lr_scheduler.step()
+                    progress.scheduler_steps += 1
             progress.batches_consumed_in_current_epoch = batch_index + 1
             if accelerator.sync_gradients:
                 if logging_fn and (progress.global_step == 1 or (logging_steps and progress.global_step % logging_steps == 0)):
@@ -461,9 +524,11 @@ def run_training_loop(*, accelerator, model, train_dataloader, optimizer, lr_sch
                 epoch_exhausted = False
                 break
         if epoch_exhausted:
+            progress.completed_epochs += 1
             progress.current_epoch += 1
+            progress.sampler_epoch = progress.current_epoch
             progress.batches_consumed_in_current_epoch = 0
-    progress.backward_calls = backward_calls
+    validate_training_progress(progress, gradient_accumulation_steps=getattr(accelerator, "accumulation", 1), dataloader_length=len(train_dataloader) if hasattr(train_dataloader, "__len__") else None)
     return progress
 
 
@@ -521,8 +586,8 @@ def _soft_keep(mask, threshold, width):
 
 
 def simulate_optimizer_update_schedule(num_micro_batches, gradient_accumulation_steps, max_train_steps,
-                                       start_global_step=0, checkpointing_steps=0, validation_steps=0):
-    global_step = int(start_global_step)
+                                       initial_global_step=0, checkpointing_steps=0, validation_steps=0):
+    global_step = int(initial_global_step)
     optimizer_steps = scheduler_steps = consumed = 0
     checkpoints, validations = [], []
     for _ in range(num_micro_batches):
@@ -707,8 +772,8 @@ def main(args):
     val_dataset = FocusFusionDataset(args.metadata_path, args.dataset_base_path, args.resolution,
         False, False, False, args.validation_max_samples, 0, False, args.prompt_mode,
         args.native_resolution, args.strict_native_size, args.input_mode, sf, args.max_pixels)
-    start_epoch_for_sampler = int(trainer_state.get("sampler_epoch", trainer_state.get("current_epoch", 0))) if trainer_state else 0
-    train_sampler = build_train_sampler(dataset, accelerator, args, start_epoch_for_sampler)
+    initial_sampler_epoch = int(trainer_state.get("sampler_epoch", trainer_state.get("current_epoch", 0))) if trainer_state else 0
+    train_sampler = build_train_sampler(dataset, accelerator, args, initial_sampler_epoch)
     loader = DataLoader(dataset, args.train_batch_size, shuffle=False, sampler=train_sampler,
                         num_workers=args.dataloader_num_workers, collate_fn=focus_fusion_collate)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=focus_fusion_collate)
@@ -746,13 +811,14 @@ def main(args):
     if verified_resume:
         accelerator.load_state(str(Path(verified_resume["checkpoint_dir"], "accelerator_state")))
         print("[RESUME] accelerator state restored")
-    resume_progress = resume_training_from_checkpoint(
-        trainer_state=trainer_state,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        accelerator=accelerator,
-        optimizer_manifest=current_manifest,
-    )
+    resume_training_from_checkpoint(trainer_state=trainer_state, accelerator=accelerator, optimizer_manifest=current_manifest)
+    progress = TrainingProgress.from_trainer_state(trainer_state)
+    if trainer_state and progress.batches_consumed_in_current_epoch == len(loader):
+        progress.completed_epochs += 1
+        progress.current_epoch += 1
+        progress.sampler_epoch = progress.current_epoch
+        progress.batches_consumed_in_current_epoch = 0
+    validate_training_progress(progress, gradient_accumulation_steps=args.gradient_accumulation_steps, dataloader_length=len(loader))
     start = resume_progress["global_step"]
     completed_epochs = resume_progress["completed_epochs"]
     resume_micro_steps = resume_progress["micro_steps_in_current_epoch"]
@@ -822,6 +888,7 @@ def main(args):
         accelerator.save_state(str(accelerator_state_dir))
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            validate_training_progress(progress, gradient_accumulation_steps=args.gradient_accumulation_steps, dataloader_length=len(loader))
             raw = accelerator.unwrap_model(model)
             raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
             payload = checkpoint_payload(
@@ -833,16 +900,9 @@ def main(args):
                 sampler_epoch=progress.current_epoch,
             )
             trainer_state = {
-                "trainer_state_version": 2,
-                "global_step": progress.global_step,
-                "current_epoch": progress.current_epoch,
-                "completed_epochs": progress.current_epoch,
-                "batches_consumed_in_current_epoch": progress.batches_consumed_in_current_epoch,
-                "micro_batches": progress.micro_batches,
-                "optimizer_updates": progress.global_step,
-                "scheduler_steps": progress.global_step,
+                "trainer_state_version": 3,
+                **progress.to_trainer_state_fields(),
                 "sampler_seed": args.seed,
-                "sampler_epoch": progress.current_epoch,
                 "dataset_length": len(dataset),
                 "world_size": accelerator.num_processes,
                 "process_count": accelerator.num_processes,
@@ -865,9 +925,7 @@ def main(args):
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         max_train_steps=args.max_train_steps,
-        global_step=resume_progress["global_step"],
-        current_epoch=resume_progress["completed_epochs"],
-        batches_consumed_in_current_epoch=resume_progress["micro_steps_in_current_epoch"],
+        progress=progress,
         compute_loss_fn=compute_loss_callback,
         checkpoint_fn=checkpoint_callback,
         validation_fn=validation_callback,

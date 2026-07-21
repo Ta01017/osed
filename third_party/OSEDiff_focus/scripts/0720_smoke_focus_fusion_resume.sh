@@ -11,7 +11,7 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"; OUTPUT_DIR="${OUTPUT_ROOT}/osediff_focus_${I
 [[ -e "$OUTPUT_DIR" ]] && { echo "output exists: $OUTPUT_DIR" >&2; exit 1; }
 mkdir -p "$OUTPUT_DIR"
 VAE_ARGS=(); [[ "$TRAIN_VAE_LORA" == "1" ]] && VAE_ARGS+=(--train_vae_lora)
-LOG1="$OUTPUT_DIR/resume_step1.log"; LOG2="$OUTPUT_DIR/resume_step2.log"
+LOG1="$OUTPUT_DIR/resume_step1.log"; LOG2="$OUTPUT_DIR/resume_step2.log"; LOG3="$OUTPUT_DIR/resume_step3.log"
 set +e
 CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
  --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
@@ -32,6 +32,8 @@ for key in ("model_state","trainer_state","optimizer_manifest"):
     p = ckpt / m[key]["filename"]
     assert compute_file_sha256(p) == m[key]["sha256"]
 state = torch.load(ckpt/"model_state.pt", map_location="cpu")
+trainer = json.loads((ckpt/"trainer_state.json").read_text())
+assert trainer["global_step"] == trainer["optimizer_updates"] == trainer["scheduler_steps"] == 1
 checks = {}
 for name in ("generator_unet_lora","vae_lora","vsd_unet_lora"):
     tensors = state.get(name, {})
@@ -64,6 +66,38 @@ for key in ("model_state","trainer_state","optimizer_manifest"):
     p = ckpt2 / m[key]["filename"]
     assert compute_file_sha256(p) == m[key]["sha256"]
 trainer = json.loads((ckpt2/"trainer_state.json").read_text())
-assert trainer["global_step"] == 2
-print("[SMOKE PASS]")
+assert trainer["global_step"] == trainer["optimizer_updates"] == trainer["scheduler_steps"] == 2
+PY
+CHECKPOINT="$OUTPUT_DIR/checkpoints/checkpoint-00000002"
+set +e
+CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
+ --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
+ --input_mode "$INPUT_MODE" --prompt_mode fixed --use_vsd "$USE_VSD" "${VAE_ARGS[@]}" --train_batch_size 1 --gradient_accumulation_steps 1 \
+ --lora_rank_unet "$LORA_RANK_UNET" --lora_rank_vae "$LORA_RANK_VAE" --lora_rank_vsd "$LORA_RANK_VSD" \
+ --max_samples 16 --max_train_steps 3 --checkpointing_steps 1 --validation_steps 1 --validation_max_samples 1 \
+ --resume_from_checkpoint "$CHECKPOINT" --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" 2>&1 | tee "$LOG3"
+code=${PIPESTATUS[0]}; set -e; [[ "$code" == "0" ]] || { echo "[SMOKE FAIL] second resume command failed: $code" >&2; exit "$code"; }
+python - "$OUTPUT_DIR" "$LOG2" "$LOG3" <<'PY'
+import json, sys
+from pathlib import Path
+from osediff_focus_fusion import compute_file_sha256
+out = Path(sys.argv[1])
+for log_path in map(Path, sys.argv[2:]):
+    text = log_path.read_text(errors="replace")
+    for needle in ("checkpoint verified", "resume config validated", "sampler state validated", "optimizer manifest validated", "accelerator state restored", "trainer state restored"):
+        assert needle in text, (log_path, needle)
+states = []
+for step in (1, 2, 3):
+    ckpt = out/"checkpoints"/f"checkpoint-{step:08d}"
+    m = json.loads((ckpt/"checkpoint_complete.json").read_text())
+    assert m["global_step"] == step
+    assert (ckpt/"accelerator_state").is_dir() and any((ckpt/"accelerator_state").iterdir())
+    for key in ("model_state","trainer_state","optimizer_manifest"):
+        p = ckpt / m[key]["filename"]
+        assert compute_file_sha256(p) == m[key]["sha256"]
+    trainer = json.loads((ckpt/"trainer_state.json").read_text())
+    assert trainer["global_step"] == trainer["optimizer_updates"] == trainer["scheduler_steps"] == step
+    states.append(trainer)
+assert states[0]["micro_batches"] < states[1]["micro_batches"] < states[2]["micro_batches"]
+print("[RESUME SMOKE PASS]")
 PY

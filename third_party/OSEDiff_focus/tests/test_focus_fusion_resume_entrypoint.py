@@ -5,6 +5,7 @@ import torch
 
 from train_osediff_focus_fusion import (
     parse_args,
+    normalize_model_identifier,
     resume_training_from_checkpoint,
     validate_sampler_resume_state,
     validate_resume_configuration,
@@ -169,5 +170,28 @@ def test_validate_resume_configuration_reports_multiple_mismatches():
             validate_resume_configuration(saved_config=saved, current_config=current)
         text = str(exc.value)
         assert "metadata_path" in text and "train_batch_size" in text and "learning_rate" in text
+    finally:
+        train_mod.RESUME_CONFIG_FIELDS = original
+
+
+def test_normalize_model_identifier_preserves_hub_id_and_resolves_existing_path(tmp_path):
+    assert normalize_model_identifier("stabilityai/stable-diffusion-2-1-base") == "stabilityai/stable-diffusion-2-1-base"
+    assert normalize_model_identifier(None) is None
+    assert normalize_model_identifier(str(tmp_path)) == str(tmp_path.resolve())
+
+
+def test_validate_resume_configuration_rejects_vsd_and_scheduler_fields():
+    fields = {"cfg_vsd", "lr_num_cycles", "lr_power", "max_grad_norm", "keep_threshold", "keep_soft_width"}
+    saved = {f: 1 for f in fields}
+    current = {f: 2 for f in fields}
+    import train_osediff_focus_fusion as train_mod
+    original = train_mod.RESUME_CONFIG_FIELDS
+    train_mod.RESUME_CONFIG_FIELDS = fields
+    try:
+        with pytest.raises(ValueError) as exc:
+            validate_resume_configuration(saved_config=saved, current_config=current)
+        text = str(exc.value)
+        for field in fields:
+            assert field in text
     finally:
         train_mod.RESUME_CONFIG_FIELDS = original

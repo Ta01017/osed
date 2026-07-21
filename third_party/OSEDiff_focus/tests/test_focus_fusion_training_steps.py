@@ -1,9 +1,10 @@
 import contextlib
 
+import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from train_osediff_focus_fusion import run_training_loop, simulate_optimizer_update_schedule
+from train_osediff_focus_fusion import TrainingProgress, run_training_loop, simulate_optimizer_update_schedule, validate_training_progress
 
 
 class CountingAccelerator:
@@ -14,9 +15,9 @@ class CountingAccelerator:
 
     @contextlib.contextmanager
     def accumulate(self, model):
+        self.sync_gradients = (self.micro + 1) % self.accumulation == 0
         yield
         self.micro += 1
-        self.sync_gradients = self.micro % self.accumulation == 0
 
     def backward(self, loss):
         loss.backward()
@@ -53,8 +54,10 @@ def test_run_training_loop_accumulation_four_max_steps_three():
         accelerator=CountingAccelerator(4),
         model=model,
         train_dataloader=loader,
+        train_sampler=None,
         optimizer=optimizer,
         lr_scheduler=scheduler,
+        progress=TrainingProgress(),
         max_train_steps=3,
         checkpointing_steps=2,
         validation_steps=3,
@@ -63,7 +66,6 @@ def test_run_training_loop_accumulation_four_max_steps_three():
         validation_fn=lambda p: validations.append(p.global_step),
     )
     assert result.micro_batches == 12
-    assert result.backward_calls == 12
     assert result.optimizer_updates == 3
     assert scheduler.count == 3
     assert result.global_step == 3
@@ -80,10 +82,11 @@ def test_run_training_loop_resume_counts_only_remaining_updates():
         accelerator=CountingAccelerator(4),
         model=model,
         train_dataloader=loader,
+        train_sampler=None,
         optimizer=optimizer,
         lr_scheduler=scheduler,
         max_train_steps=3,
-        global_step=1,
+        progress=TrainingProgress(global_step=1, optimizer_updates=1, scheduler_steps=1, micro_batches=4),
         compute_loss_fn=lambda m, b: m(b),
     )
     assert result.optimizer_updates == 2
@@ -94,3 +97,40 @@ def test_run_training_loop_resume_counts_only_remaining_updates():
 def test_simulation_remains_auxiliary_only():
     s = simulate_optimizer_update_schedule(20, 4, 3)
     assert s["optimizer_steps"] == 3
+
+
+def test_training_progress_from_trainer_state_restores_all_fields():
+    state = {"global_step": 2, "current_epoch": 1, "completed_epochs": 1, "batches_consumed_in_current_epoch": 3,
+             "micro_batches": 8, "optimizer_updates": 2, "scheduler_steps": 2, "sampler_epoch": 1}
+    p = TrainingProgress.from_trainer_state(state)
+    assert p.to_trainer_state_fields() == state
+
+
+def test_accumulation_four_continuous_resume_4_8_12():
+    loader = DataLoader(TensorDataset(torch.ones(20, 1)), batch_size=1)
+    progress = TrainingProgress()
+    for target, expected_micro in [(1, 4), (2, 8), (3, 12)]:
+        model = Tiny()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        scheduler = CountingScheduler()
+        progress = run_training_loop(
+            accelerator=CountingAccelerator(4),
+            model=model,
+            train_dataloader=loader,
+            train_sampler=None,
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            progress=progress,
+            max_train_steps=target,
+            compute_loss_fn=lambda m, b: m(b),
+        )
+        assert progress.global_step == target
+        assert progress.optimizer_updates == target
+        assert progress.scheduler_steps == target
+        assert progress.micro_batches == expected_micro
+        validate_training_progress(progress, gradient_accumulation_steps=4, dataloader_length=len(loader))
+
+
+def test_validate_training_progress_rejects_counter_mismatch():
+    with pytest.raises(ValueError, match="optimizer_updates"):
+        validate_training_progress(TrainingProgress(global_step=2, optimizer_updates=1, scheduler_steps=2), gradient_accumulation_steps=1)

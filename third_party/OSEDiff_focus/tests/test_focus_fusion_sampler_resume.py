@@ -86,3 +86,36 @@ def test_validate_sampler_resume_state_rejects_batch_position_overflow():
         validate_sampler_resume_state(saved, dataset_length=32, world_size=1, train_batch_size=1,
                                       gradient_accumulation_steps=1, sampler_seed=123, drop_last=False,
                                       dataloader_length=32)
+
+
+def test_validate_sampler_resume_state_rejects_progress_counter_mismatches():
+    saved = {
+        "trainer_state_version": 3,
+        "world_size": 1,
+        "dataset_length": 32,
+        "train_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "sampler_seed": 123,
+        "drop_last": False,
+        "current_epoch": 0,
+        "sampler_epoch": 0,
+        "completed_epochs": 0,
+        "batches_consumed_in_current_epoch": 0,
+        "global_step": 2,
+        "optimizer_updates": 1,
+        "scheduler_steps": 2,
+        "micro_batches": 2,
+    }
+    with pytest.raises(ValueError, match="optimizer_updates"):
+        validate_sampler_resume_state(saved, dataset_length=32, world_size=1, train_batch_size=1,
+                                      gradient_accumulation_steps=1, sampler_seed=123, drop_last=False)
+    saved["optimizer_updates"] = 2
+    saved["scheduler_steps"] = 1
+    with pytest.raises(ValueError, match="scheduler_steps"):
+        validate_sampler_resume_state(saved, dataset_length=32, world_size=1, train_batch_size=1,
+                                      gradient_accumulation_steps=1, sampler_seed=123, drop_last=False)
+    saved["scheduler_steps"] = 2
+    saved["micro_batches"] = 1
+    with pytest.raises(ValueError, match="micro_batches"):
+        validate_sampler_resume_state(saved, dataset_length=32, world_size=1, train_batch_size=1,
+                                      gradient_accumulation_steps=1, sampler_seed=123, drop_last=False)

@@ -199,6 +199,23 @@ def test_verified_checkpoint_rejects_missing_accelerator_state(tmp_path):
         load_verified_checkpoint(final_dir)
 
 
+def test_verified_checkpoint_rejects_progress_fields_in_model_state(tmp_path):
+    final_dir = tmp_path / "checkpoint-00000001"
+    temp_dir = prepare_checkpoint_temp_dir(final_dir)
+    (temp_dir / "accelerator_state").mkdir()
+    write_json_atomically(temp_dir / "accelerator_state" / "rank0.json", {"ok": True})
+    payload = checkpoint_payload(TinyModel(), 1, _args())
+    payload["global_step"] = 999
+    trainer = {"global_step": 1}
+    optim = []
+    torch.save(payload, temp_dir / "model_state.pt")
+    write_json_atomically(temp_dir / "trainer_state.json", trainer)
+    write_json_atomically(temp_dir / "optimizer_manifest.json", optim)
+    finalize_checkpoint_directory(temp_dir, final_dir, payload, trainer, optim)
+    with pytest.raises(RuntimeError, match="INVALID MODEL STATE"):
+        load_verified_checkpoint(final_dir)
+
+
 class SingleAccelerator:
     num_processes = 1
     is_main_process = True

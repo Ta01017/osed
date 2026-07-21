@@ -295,6 +295,17 @@ def load_verified_checkpoint(checkpoint_path):
             f"checkpoint global_step mismatch: manifest={manifest['global_step']} "
             f"trainer_state={verified['trainer_state'].get('global_step')}"
         )
+    forbidden_progress = {
+        "global_step", "current_epoch", "completed_epochs", "micro_batches",
+        "optimizer_updates", "scheduler_steps", "batches_consumed_in_current_epoch",
+        "sampler_epoch", "sampler_seed", "optimizer", "lr_scheduler", "scaler_state", "rng_state",
+    }
+    present = sorted(forbidden_progress.intersection(verified["model_state"]))
+    if present:
+        raise RuntimeError(
+            "[INVALID MODEL STATE] training progress fields must be stored in trainer_state.json; "
+            f"found={present}"
+        )
     print(f"checkpoint verified: {checkpoint_dir}")
     return verified
 
