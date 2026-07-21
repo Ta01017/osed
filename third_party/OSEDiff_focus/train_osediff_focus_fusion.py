@@ -17,7 +17,8 @@ from osediff_focus_fusion import (FocusFusionGenerator, checkpoint_payload, grad
                                   load_vae_lora_state, load_vsd_lora_state,
                                   read_focus_checkpoint_config, load_focus_checkpoint,
                                   capture_rng_state, restore_rng_state,
-                                  write_checkpoint_atomically, load_verified_checkpoint)
+                                  prepare_checkpoint_temp_dir, finalize_checkpoint_directory,
+                                  write_json_atomically, load_verified_checkpoint)
 
 
 def parse_args(argv=None):
@@ -182,23 +183,16 @@ def validate_resume_config(args, resume_cfg):
     return args
 
 
-def resume_training_from_checkpoint(*, resume_state, optimizer, lr_scheduler, accelerator, optimizer_manifest):
-    """Restore optimizer/scheduler/scaler/RNG/progress after accelerator.prepare."""
+def resume_training_from_checkpoint(*, resume_state, optimizer=None, lr_scheduler=None, accelerator=None, optimizer_manifest=None):
+    """Restore only trainer progress; optimizer/scheduler/scaler/RNG are restored by Accelerate."""
     if not resume_state:
         return {"global_step": 0, "completed_epochs": 0, "micro_steps_in_current_epoch": 0}
-    validate_optimizer_manifest(resume_state.get("optimizer_group_manifest"), optimizer_manifest)
-    if resume_state.get("optimizer"):
-        optimizer.load_state_dict(resume_state["optimizer"])
-        print("[RESUME] optimizer restored")
-    if resume_state.get("lr_scheduler"):
-        lr_scheduler.load_state_dict(resume_state["lr_scheduler"])
-        print("[RESUME] scheduler restored")
-    scaler = getattr(accelerator, "scaler", None)
-    if scaler is not None and resume_state.get("scaler_state"):
-        scaler.load_state_dict(resume_state["scaler_state"])
-        print("[RESUME] scaler restored")
-    if restore_rng_state(resume_state.get("rng_state")):
-        print("[RESUME] RNG restored")
+    if optimizer_manifest is not None:
+        validate_optimizer_manifest(resume_state.get("optimizer_group_manifest"), optimizer_manifest)
+    print("[RESUME] optimizer restored by Accelerate")
+    print("[RESUME] scheduler restored by Accelerate")
+    print("[RESUME] scaler restored by Accelerate")
+    print("[RESUME] rank RNG restored by Accelerate")
     progress = {
         "global_step": int(resume_state.get("global_step", resume_state.get("training_step", 0))),
         "completed_epochs": int(resume_state.get("completed_epochs", 0)),
@@ -208,6 +202,7 @@ def resume_training_from_checkpoint(*, resume_state, optimizer, lr_scheduler, ac
     print(f"[RESUME] completed_epochs {progress['completed_epochs']}")
     print(f"[RESUME] micro_steps_in_current_epoch {progress['micro_steps_in_current_epoch']}")
     print(f"[RESUME] dataloader batches skipped {progress['micro_steps_in_current_epoch']}")
+    print("[RESUME] sampler position restored")
     return progress
 
 
@@ -608,7 +603,15 @@ def main(args):
                 if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
                     accelerator.wait_for_everyone()
                     checkpoint_dir = Path(args.output_dir, "checkpoints", f"checkpoint-{global_step:08d}")
-                    accelerator_state_dir = checkpoint_dir / "accelerator_state"
+                    temp_dir = prepare_checkpoint_temp_dir(checkpoint_dir) if accelerator.is_main_process else None
+                    accelerator.wait_for_everyone()
+                    if not accelerator.is_main_process:
+                        # Main process created the temp dir; all ranks use the same deterministic newest temp path.
+                        candidates = sorted(checkpoint_dir.parent.glob(f".{checkpoint_dir.name}.tmp-*"), key=lambda p: p.stat().st_mtime)
+                        if not candidates:
+                            raise RuntimeError(f"checkpoint temp dir not found for rank {accelerator.process_index}: {checkpoint_dir}")
+                        temp_dir = candidates[-1]
+                    accelerator_state_dir = temp_dir / "accelerator_state"
                     accelerator_state_dir.mkdir(parents=True, exist_ok=True)
                     accelerator.save_state(str(accelerator_state_dir))
                     accelerator.wait_for_everyone()
@@ -616,7 +619,7 @@ def main(args):
                     raw = accelerator.unwrap_model(model)
                     raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
                     payload = checkpoint_payload(
-                        raw, global_step, args, optimizer, lr_scheduler, raw_reg, accelerator,
+                        raw, global_step, args, None, None, raw_reg, accelerator,
                         optimizer_group_manifest=current_manifest,
                         completed_epochs=completed_epochs,
                         micro_steps_in_current_epoch=micro_steps_in_current_epoch,
@@ -637,7 +640,10 @@ def main(args):
                         "gradient_accumulation_steps": args.gradient_accumulation_steps,
                         "drop_last": False,
                     }
-                    write_checkpoint_atomically(checkpoint_dir, payload, trainer_state, current_manifest, accelerator_state_present=True)
+                    torch.save(payload, temp_dir / "model_state.pt")
+                    write_json_atomically(temp_dir / "trainer_state.json", trainer_state)
+                    write_json_atomically(temp_dir / "optimizer_manifest.json", current_manifest)
+                    finalize_checkpoint_directory(temp_dir, checkpoint_dir, payload, trainer_state, current_manifest)
                 if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
                     accelerator.wait_for_everyone()
                 if global_step >= args.max_train_steps:

@@ -213,39 +213,50 @@ def write_json_atomically(path, data):
     os.replace(tmp, path)
 
 
-def write_checkpoint_atomically(checkpoint_dir, model_state, trainer_state, optimizer_manifest, accelerator_state_present=False):
-    import shutil
+def prepare_checkpoint_temp_dir(final_dir):
+    import uuid
 
-    checkpoint_dir = Path(checkpoint_dir)
-    existing_accelerator_state = checkpoint_dir / "accelerator_state"
-    tmp_dir = checkpoint_dir.with_name(checkpoint_dir.name + ".tmp")
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True)
-    if accelerator_state_present and existing_accelerator_state.is_dir():
-        shutil.copytree(existing_accelerator_state, tmp_dir / "accelerator_state")
-    model_path = tmp_dir / "model_state.pt"
-    trainer_path = tmp_dir / "trainer_state.json"
-    optim_path = tmp_dir / "optimizer_manifest.json"
-    torch.save(model_state, model_path)
-    write_json_atomically(trainer_path, trainer_state)
-    write_json_atomically(optim_path, optimizer_manifest)
-    if checkpoint_dir.exists():
-        shutil.rmtree(checkpoint_dir)
-    os.replace(tmp_dir, checkpoint_dir)
+    final_dir = Path(final_dir)
+    if final_dir.exists():
+        raise FileExistsError(f"checkpoint already exists and will not be overwritten: {final_dir}")
+    temp_dir = final_dir.parent / f".{final_dir.name}.tmp-{uuid.uuid4().hex}"
+    temp_dir.mkdir(parents=True)
+    return temp_dir
+
+
+def finalize_checkpoint_directory(temp_dir, final_dir, model_state, trainer_state, optimizer_manifest):
+    temp_dir = Path(temp_dir)
+    final_dir = Path(final_dir)
+    if final_dir.exists():
+        raise FileExistsError(f"checkpoint already exists and will not be overwritten: {final_dir}")
     manifest = {
         "complete": True,
         "checkpoint_version": 2,
         "global_step": int(trainer_state["global_step"]),
         "input_mode": model_state["input_mode"],
         "generator_in_channels": int(model_state["generator_in_channels"]),
-        "model_state": _file_entry(checkpoint_dir / "model_state.pt"),
-        "trainer_state": _file_entry(checkpoint_dir / "trainer_state.json"),
-        "optimizer_manifest": _file_entry(checkpoint_dir / "optimizer_manifest.json"),
-        "accelerator_state_present": bool(accelerator_state_present),
+        "model_state": _file_entry(temp_dir / "model_state.pt"),
+        "trainer_state": _file_entry(temp_dir / "trainer_state.json"),
+        "optimizer_manifest": _file_entry(temp_dir / "optimizer_manifest.json"),
+        "accelerator_state_present": (temp_dir / "accelerator_state").is_dir(),
     }
-    write_json_atomically(checkpoint_dir / "checkpoint_complete.json", manifest)
+    if not manifest["accelerator_state_present"] or not any((temp_dir / "accelerator_state").iterdir()):
+        raise RuntimeError(f"accelerator_state directory is missing or empty: {temp_dir / 'accelerator_state'}")
+    write_json_atomically(temp_dir / "checkpoint_complete.json", manifest)
+    os.replace(temp_dir, final_dir)
     return manifest
+
+
+def write_checkpoint_atomically(checkpoint_dir, model_state, trainer_state, optimizer_manifest, accelerator_state_present=False):
+    """Compatibility helper for tests: writes non-Accelerate files into a fresh temp dir."""
+    temp_dir = prepare_checkpoint_temp_dir(checkpoint_dir)
+    if accelerator_state_present:
+        (temp_dir / "accelerator_state").mkdir()
+        write_json_atomically(temp_dir / "accelerator_state" / "state.json", {"present": True})
+    torch.save(model_state, temp_dir / "model_state.pt")
+    write_json_atomically(temp_dir / "trainer_state.json", trainer_state)
+    write_json_atomically(temp_dir / "optimizer_manifest.json", optimizer_manifest)
+    return finalize_checkpoint_directory(temp_dir, checkpoint_dir, model_state, trainer_state, optimizer_manifest)
 
 
 def load_verified_checkpoint(checkpoint_path):
@@ -261,6 +272,8 @@ def load_verified_checkpoint(checkpoint_path):
         raise RuntimeError(f"invalid checkpoint manifest: {manifest_path}")
     if manifest.get("accelerator_state_present") and not (checkpoint_dir / "accelerator_state").is_dir():
         raise RuntimeError(f"accelerator_state directory missing: {checkpoint_dir / 'accelerator_state'}")
+    if manifest.get("accelerator_state_present") and not any((checkpoint_dir / "accelerator_state").iterdir()):
+        raise RuntimeError(f"accelerator_state directory is empty: {checkpoint_dir / 'accelerator_state'}")
     verified = {"manifest": manifest, "checkpoint_dir": str(checkpoint_dir)}
     for key in ("model_state", "trainer_state", "optimizer_manifest"):
         entry = manifest[key]
@@ -413,18 +426,32 @@ class FocusFusionGenerator(nn.Module):
 
     def forward_from_latents(self, latents, focus_a=None, focus_b=None, prompt_embeds=None,
                              tiled=False, tile_size=96, tile_overlap=32):
+        pred = self.predict_noise_from_latents(latents, focus_a, focus_b, prompt_embeds, tiled, tile_size, tile_overlap)
+        denoised = self.scheduler_step_from_prediction(pred, latents[0])
+        output = self.decode_latents(denoised, reference_image=latents[0])
+        return output, denoised, pred
+
+    def predict_noise_from_latents(self, latents, focus_a=None, focus_b=None, prompt_embeds=None,
+                                   tiled=False, tile_size=96, tile_overlap=32):
         z_a = latents[0]
         unet_input = self.make_unet_input(latents, focus_a, focus_b)
         ts = self.timesteps.to(z_a.device)
         if hasattr(self.scheduler, "alphas_cumprod") and self.scheduler.alphas_cumprod.device != z_a.device:
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(z_a.device)
         if tiled:
-            pred = tiled_unet_forward(self.unet, unet_input, ts, prompt_embeds, 4, tile_size, tile_overlap)
-        else:
-            pred = self.unet(unet_input, ts, encoder_hidden_states=prompt_embeds).sample
-        denoised = self.scheduler.step(pred, ts, z_a, return_dict=True).prev_sample
-        output = self.vae.decode(denoised / self.vae.config.scaling_factor).sample.clamp(-1, 1)
-        return output, denoised, pred
+            return tiled_unet_forward(self.unet, unet_input, ts, prompt_embeds, 4, tile_size, tile_overlap)
+        return self.unet(unet_input, ts, encoder_hidden_states=prompt_embeds).sample
+
+    def scheduler_step_from_prediction(self, model_pred, z_a):
+        ts = self.timesteps.to(z_a.device)
+        return self.scheduler.step(model_pred, ts, z_a, return_dict=True).prev_sample
+
+    def decode_latents(self, latents, reference_image=None):
+        output = self.vae.decode(latents / self.vae.config.scaling_factor).sample.clamp(-1, 1)
+        if reference_image is not None and hasattr(reference_image, "shape") and output.shape[-2:] == reference_image.shape[-2:]:
+            pass
+        assert output.shape[1] == 3
+        return output
 
 
 def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd=None, accelerator=None,

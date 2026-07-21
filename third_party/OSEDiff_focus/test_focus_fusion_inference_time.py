@@ -124,15 +124,16 @@ def run_real(args, device):
             s = time.perf_counter(); latents = prepare_condition_latents(model, conditions, args.vae_encode_mode); _sync(device); e = time.perf_counter()
             fa = focus_maps[0] if focus_maps else None
             fb = focus_maps[1] if len(focus_maps) > 1 else None
-            _ = model.make_unet_input(latents, fa, fb)
+            sb = time.perf_counter(); model.make_unet_input(latents, fa, fb); _sync(device); eb = time.perf_counter()
             s2 = time.perf_counter()
-            out, den, pred = model.forward_from_latents(latents, fa, fb, prompt, args.tiled, args.latent_tiled_size, args.latent_tiled_overlap)
+            pred = model.predict_noise_from_latents(latents, fa, fb, prompt, args.tiled, args.latent_tiled_size, args.latent_tiled_overlap)
             _sync(device); e2 = time.perf_counter()
-            s3 = time.perf_counter(); _ = den; _sync(device); e3 = time.perf_counter()
-            s4 = time.perf_counter(); _ = out; _sync(device); e4 = time.perf_counter()
+            s3 = time.perf_counter(); den = model.scheduler_step_from_prediction(pred, latents[0]); _sync(device); e3 = time.perf_counter()
+            s4 = time.perf_counter(); model.decode_latents(den); _sync(device); e4 = time.perf_counter()
         t1 = time.perf_counter()
         if i >= args.warmup_iterations:
             phase["vae_encode"] += e - s
+            phase["build_input"] = phase.get("build_input", 0.0) + eb - sb
             phase["unet_one_step"] += e2 - s2
             phase["scheduler_step"] += e3 - s3
             phase["vae_decode"] += e4 - s4

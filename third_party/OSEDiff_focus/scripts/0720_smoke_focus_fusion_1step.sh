@@ -9,6 +9,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-experiments/focus_fusion_smoke}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"; OUTPUT_DIR="${OUTPUT_ROOT}/osediff_focus_${INPUT_MODE}_native_smoke1_${TIMESTAMP}"
 [[ -e "$OUTPUT_DIR" ]] && { echo "output exists: $OUTPUT_DIR" >&2; exit 1; }
 LOG="$OUTPUT_DIR/smoke_1step.log"
+mkdir -p "$OUTPUT_DIR"
 set +e
 CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_focus_fusion.py \
  --pretrained_model_name_or_path "$PRETRAINED_MODEL" --metadata_path "$METADATA" --dataset_base_path "$DATASET_BASE" --output_dir "$OUTPUT_DIR" \
@@ -18,7 +19,7 @@ CUDA_VISIBLE_DEVICES="$GPU" accelerate launch --num_processes 1 train_osediff_fo
  --native_resolution --strict_native_size --mixed_precision "$MIXED_PRECISION" 2>&1 | tee "$LOG"
 code=${PIPESTATUS[0]}
 set -e
-[[ "$code" == "0" ]] || { echo "training failed" >&2; exit 1; }
+[[ "$code" == "0" ]] || { echo "[SMOKE FAIL] training command failed: $code" >&2; exit "$code"; }
 python - "$OUTPUT_DIR" "$INPUT_MODE" "$LOG" <<'PY'
 import json, re, sys
 from pathlib import Path
@@ -32,6 +33,7 @@ assert not re.search(r"(nan|inf) loss", text, re.I)
 ckpt = out / "checkpoints" / "checkpoint-00000001"
 manifest = ckpt / "checkpoint_complete.json"
 assert ckpt.is_dir(), ckpt
+assert (ckpt / "accelerator_state").is_dir() and any((ckpt / "accelerator_state").iterdir())
 assert manifest.is_file(), manifest
 m = json.loads(manifest.read_text())
 assert m["complete"] is True and m["global_step"] == 1
@@ -42,6 +44,7 @@ for key in ("model_state", "trainer_state", "optimizer_manifest"):
     assert compute_file_sha256(p) == m[key]["sha256"]
 trainer = json.loads((ckpt / "trainer_state.json").read_text())
 assert trainer["global_step"] == 1
+assert m["generator_in_channels"] in (4, 8, 10, 16)
 val = out / "validation" / "global_step_000001"
 assert val.is_dir(), val
 sample = next(val.iterdir())
