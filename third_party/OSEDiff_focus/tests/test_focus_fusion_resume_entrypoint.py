@@ -15,6 +15,8 @@ def _args(**kw):
         input_mode="dual",
         condition_mode=None,
         lora_rank_unet=4,
+        lora_rank_vae=4,
+        lora_rank_vsd=8,
         train_conv_in=True,
         train_vae_lora=False,
         use_vsd=0,
@@ -28,6 +30,8 @@ def _cfg(**kw):
     base = dict(
         input_mode="dual",
         generator_lora_rank=4,
+        vae_lora_rank=4,
+        vsd_lora_rank=8,
         train_conv_in=True,
         train_vae_lora=False,
         use_vsd=False,

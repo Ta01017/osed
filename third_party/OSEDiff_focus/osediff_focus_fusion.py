@@ -1,7 +1,10 @@
 """One-step OSEDiff generator for native-resolution focus fusion."""
 import copy
+import hashlib
+import json
 import os
 import random
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -190,6 +193,89 @@ def checkpoint_complete_path(checkpoint_path):
     return os.fspath(checkpoint_path) + ".complete.json"
 
 
+def compute_file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_entry(path):
+    return {"filename": Path(path).name, "size": os.path.getsize(path), "sha256": compute_file_sha256(path)}
+
+
+def write_json_atomically(path, data):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def write_checkpoint_atomically(checkpoint_dir, model_state, trainer_state, optimizer_manifest, accelerator_state_present=False):
+    checkpoint_dir = Path(checkpoint_dir)
+    tmp_dir = checkpoint_dir.with_name(checkpoint_dir.name + ".tmp")
+    if tmp_dir.exists():
+        import shutil
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+    model_path = tmp_dir / "model_state.pt"
+    trainer_path = tmp_dir / "trainer_state.json"
+    optim_path = tmp_dir / "optimizer_manifest.json"
+    torch.save(model_state, model_path)
+    write_json_atomically(trainer_path, trainer_state)
+    write_json_atomically(optim_path, optimizer_manifest)
+    if checkpoint_dir.exists():
+        import shutil
+        shutil.rmtree(checkpoint_dir)
+    os.replace(tmp_dir, checkpoint_dir)
+    manifest = {
+        "complete": True,
+        "checkpoint_version": 2,
+        "global_step": int(trainer_state["global_step"]),
+        "input_mode": model_state["input_mode"],
+        "generator_in_channels": int(model_state["generator_in_channels"]),
+        "model_state": _file_entry(checkpoint_dir / "model_state.pt"),
+        "trainer_state": _file_entry(checkpoint_dir / "trainer_state.json"),
+        "optimizer_manifest": _file_entry(checkpoint_dir / "optimizer_manifest.json"),
+        "accelerator_state_present": bool(accelerator_state_present),
+    }
+    write_json_atomically(checkpoint_dir / "checkpoint_complete.json", manifest)
+    return manifest
+
+
+def load_verified_checkpoint(checkpoint_path):
+    checkpoint_dir = Path(checkpoint_path)
+    if checkpoint_dir.is_file():
+        raise RuntimeError(f"legacy .pt checkpoint path is not allowed for formal entrypoints: {checkpoint_dir}")
+    manifest_path = checkpoint_dir / "checkpoint_complete.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"checkpoint_complete.json missing: {checkpoint_dir}")
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if manifest.get("complete") is not True or int(manifest.get("checkpoint_version", 0)) != 2:
+        raise RuntimeError(f"invalid checkpoint manifest: {manifest_path}")
+    verified = {"manifest": manifest, "checkpoint_dir": str(checkpoint_dir)}
+    for key in ("model_state", "trainer_state", "optimizer_manifest"):
+        entry = manifest[key]
+        path = checkpoint_dir / entry["filename"]
+        if not path.is_file():
+            raise RuntimeError(f"checkpoint file missing: {path}")
+        if os.path.getsize(path) != int(entry["size"]):
+            raise RuntimeError(f"checkpoint file size mismatch: {path}")
+        actual = compute_file_sha256(path)
+        if actual != entry["sha256"]:
+            raise RuntimeError(f"checkpoint sha256 mismatch: {path}")
+        if key == "model_state":
+            verified[key] = torch.load(path, map_location="cpu")
+        else:
+            with open(path, "r", encoding="utf-8") as handle:
+                verified[key] = json.load(handle)
+    print(f"checkpoint verified: {checkpoint_dir}")
+    return verified
+
+
 def write_checkpoint_complete_manifest(checkpoint_path, payload):
     import json
 
@@ -320,6 +406,21 @@ class FocusFusionGenerator(nn.Module):
         assert output.shape[1] == 3
         return output, denoised, pred
 
+    def forward_from_latents(self, latents, focus_a=None, focus_b=None, prompt_embeds=None,
+                             tiled=False, tile_size=96, tile_overlap=32):
+        z_a = latents[0]
+        unet_input = self.make_unet_input(latents, focus_a, focus_b)
+        ts = self.timesteps.to(z_a.device)
+        if hasattr(self.scheduler, "alphas_cumprod") and self.scheduler.alphas_cumprod.device != z_a.device:
+            self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(z_a.device)
+        if tiled:
+            pred = tiled_unet_forward(self.unet, unet_input, ts, prompt_embeds, 4, tile_size, tile_overlap)
+        else:
+            pred = self.unet(unet_input, ts, encoder_hidden_states=prompt_embeds).sample
+        denoised = self.scheduler.step(pred, ts, z_a, return_dict=True).prev_sample
+        output = self.vae.decode(denoised / self.vae.config.scaling_factor).sample.clamp(-1, 1)
+        return output, denoised, pred
+
 
 def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd=None, accelerator=None,
                        optimizer_group_manifest=None, completed_epochs=0, micro_steps_in_current_epoch=0,
@@ -332,15 +433,15 @@ def checkpoint_payload(model, step, args, optimizer=None, lr_scheduler=None, vsd
             "generator_unet_lora": unet_state,
             "generator_lora_adapter_name": getattr(model, "generator_lora_adapter_name", "focus_fusion"),
             "generator_unet_lora_targets": getattr(model, "focus_lora_targets", []),
-            "rank_unet": getattr(model, "lora_rank_unet", getattr(args, "lora_rank_unet", None)),
+            "rank_unet": getattr(model, "generator_lora_rank", getattr(model, "lora_rank_unet", getattr(args, "lora_rank_unet", None))),
             "vae_lora_targets": getattr(model, "focus_vae_lora_targets", []),
             "vae_lora_adapter_name": getattr(model, "vae_lora_adapter_name", "focus_vae_encoder"),
-            "rank_vae": getattr(model, "lora_rank_vae", getattr(args, "lora_rank_unet", None)),
+            "rank_vae": getattr(model, "vae_lora_rank", getattr(args, "lora_rank_vae", None)),
             "vae_lora": {k: v.detach().cpu() for k, v in model.vae.state_dict().items() if "lora" in k},
             "vsd_unet_lora": {k: v.detach().cpu() for k, v in vsd.unet_update.state_dict().items() if "lora" in k} if vsd is not None else {},
             "vsd_lora_targets": getattr(vsd, "lora_unet_modules_encoder", []) + getattr(vsd, "lora_unet_modules_decoder", []) + getattr(vsd, "lora_unet_others", []) if vsd is not None else [],
             "vsd_lora_adapter_name": getattr(vsd, "vsd_lora_adapter_name", "default_others") if vsd is not None else None,
-            "rank_vsd": getattr(args, "lora_rank", getattr(args, "lora_rank_unet", None)),
+            "rank_vsd": getattr(model, "vsd_lora_rank", getattr(args, "lora_rank_vsd", None)),
             "train_conv_in": bool(getattr(args, "train_conv_in", True)),
             "train_vae_lora": bool(getattr(args, "train_vae_lora", False)),
             "use_vsd": bool(getattr(args, "use_vsd", False)),
@@ -378,6 +479,8 @@ def load_focus_checkpoint(model, checkpoint, load_lora=True):
     if "weight" not in state["generator_conv_in"] or ("bias" in model.unet.conv_in.state_dict() and "bias" not in state["generator_conv_in"]):
         raise RuntimeError("checkpoint did not provide required conv_in weight/bias")
     if load_lora:
+        if "generator_unet_lora" not in state or not isinstance(state["generator_unet_lora"], dict) or not state["generator_unet_lora"]:
+            raise RuntimeError("Generator LoRA checkpoint state is required and must be a non-empty dict")
         load_generator_lora_state(model, state)
     if state.get("fixed_prompt_embedding") is not None:
         model.cache_prompt(state["fixed_prompt_embedding"])

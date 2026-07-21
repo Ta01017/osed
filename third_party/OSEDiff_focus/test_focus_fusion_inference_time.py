@@ -10,7 +10,8 @@ import torch
 
 from osediff_focus_fusion import (FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint,
                                   move_scheduler_to_device, normalize_input_mode, read_focus_checkpoint_config,
-                                  load_vae_lora_state, get_generator_in_channels)
+                                  load_vae_lora_state, get_generator_in_channels, load_verified_checkpoint)
+from test_osediff_focus_fusion import prepare_condition_latents
 
 
 def parse_args():
@@ -64,7 +65,8 @@ def run_real(args, device):
     from models.autoencoder_kl import AutoencoderKL
     from models.unet_2d_condition import UNet2DConditionModel
 
-    ckpt = read_focus_checkpoint_config(args.checkpoint_path)
+    verified = load_verified_checkpoint(args.checkpoint_path)
+    ckpt = read_focus_checkpoint_config(verified["model_state"])
     state = ckpt["state"]
     ckpt_mode = ckpt["input_mode"]
     if args.input_mode is not None and normalize_input_mode(args.input_mode) != ckpt_mode:
@@ -107,9 +109,11 @@ def run_real(args, device):
     _sync(device)
     preprocess_time = time.perf_counter() - prep_start
     prompt = model.fixed_prompt_embedding
+    prompt_source = "checkpoint_cached_fixed_prompt"
     if not prompt.numel():
-        prompt = torch.zeros(1, 77, 1024)
+        raise RuntimeError("fixed prompt embedding is absent; benchmark must compute a real embedding before timing, not use zeros")
     prompt = prompt.to(device=device, dtype=dtype)
+    print(f"prompt_embedding_source: {prompt_source}")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     phase = {"image_load_preprocess": 0.0, "vae_encode": 0.0, "unet_one_step": 0.0, "scheduler_step": 0.0, "vae_decode": 0.0, "end_to_end": 0.0}
@@ -117,22 +121,15 @@ def run_real(args, device):
         _sync(device)
         t0 = time.perf_counter()
         with torch.no_grad():
-            s = time.perf_counter(); latents = model.encode_images(*conditions, mode=args.vae_encode_mode); _sync(device); e = time.perf_counter()
-            z_a = latents[0]
+            s = time.perf_counter(); latents = prepare_condition_latents(model, conditions, args.vae_encode_mode); _sync(device); e = time.perf_counter()
             fa = focus_maps[0] if focus_maps else None
             fb = focus_maps[1] if len(focus_maps) > 1 else None
-            from osediff_focus_fusion import build_generator_unet_input
-            unet_input = build_generator_unet_input(args.input_mode, latents, fa, fb)
-            ts = model.timesteps.to(device)
+            _ = model.make_unet_input(latents, fa, fb)
             s2 = time.perf_counter()
-            if args.tiled:
-                from osediff_focus_fusion import tiled_unet_forward
-                pred = tiled_unet_forward(model.unet, unet_input, ts, prompt, 4, args.latent_tiled_size, args.latent_tiled_overlap)
-            else:
-                pred = model.unet(unet_input, ts, encoder_hidden_states=prompt).sample
+            out, den, pred = model.forward_from_latents(latents, fa, fb, prompt, args.tiled, args.latent_tiled_size, args.latent_tiled_overlap)
             _sync(device); e2 = time.perf_counter()
-            s3 = time.perf_counter(); den = model.scheduler.step(pred, ts, z_a, return_dict=True).prev_sample; _sync(device); e3 = time.perf_counter()
-            s4 = time.perf_counter(); model.vae.decode(den / model.vae.config.scaling_factor).sample; _sync(device); e4 = time.perf_counter()
+            s3 = time.perf_counter(); _ = den; _sync(device); e3 = time.perf_counter()
+            s4 = time.perf_counter(); _ = out; _sync(device); e4 = time.perf_counter()
         t1 = time.perf_counter()
         if i >= args.warmup_iterations:
             phase["vae_encode"] += e - s

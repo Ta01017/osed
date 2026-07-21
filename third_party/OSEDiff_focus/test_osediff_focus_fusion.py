@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT, focus_fusion_collate
 from osediff_focus_fusion import (FocusFusionGenerator, expand_unet_conv_in, load_focus_checkpoint,
                                   move_scheduler_to_device, normalize_input_mode, read_focus_checkpoint_config,
-                                  load_vae_lora_state)
+                                  load_vae_lora_state, load_verified_checkpoint)
 
 
 def parse_args(argv=None):
@@ -53,12 +53,48 @@ def soft_keep(mask, threshold, width):
     return ((mask - (threshold - width / 2)) / width).clamp(0, 1)
 
 
+def prepare_condition_latents(model, condition_images, vae_encode_mode, generator=None):
+    del generator
+    with torch.no_grad():
+        return model.encode_images(*condition_images, mode=vae_encode_mode)
+
+
+def ablation_latents_and_focus(input_mode, mode, base_latents, focus_maps):
+    latents = [z.clone() for z in base_latents]
+    fmaps = [f.clone() for f in focus_maps]
+    if mode == "normal":
+        return latents, fmaps
+    if mode == "refs_equal_a":
+        for i in range(1, len(latents)):
+            latents[i] = latents[0].clone()
+            assert torch.equal(latents[i], latents[0])
+        if input_mode == "ab_focus":
+            fmaps[1] = fmaps[0].clone()
+        return latents, fmaps
+    if mode == "refs_zero":
+        for i in range(1, len(latents)):
+            latents[i] = torch.zeros_like(latents[i])
+        if input_mode == "ab_focus":
+            fmaps[1] = torch.zeros_like(fmaps[1])
+        return latents, fmaps
+    raise ValueError(f"unknown condition ablation: {mode}")
+
+
+def run_ablation_from_latents(model, input_mode, mode, base_latents, focus_maps, prompt_embeds, args):
+    latents, ablated_focus = ablation_latents_and_focus(input_mode, mode, base_latents, focus_maps)
+    fa = ablated_focus[0] if ablated_focus else None
+    fb = ablated_focus[1] if len(ablated_focus) > 1 else None
+    with torch.no_grad():
+        return model.forward_from_latents(latents, fa, fb, prompt_embeds, args.tiled, args.latent_tiled_size, args.latent_tiled_overlap)[0]
+
+
 def main(args):
     from diffusers import DDPMScheduler
     from transformers import AutoTokenizer, CLIPTextModel
     from models.autoencoder_kl import AutoencoderKL
     from models.unet_2d_condition import UNet2DConditionModel
-    ckpt = read_focus_checkpoint_config(args.checkpoint_path)
+    verified = load_verified_checkpoint(args.checkpoint_path)
+    ckpt = read_focus_checkpoint_config(verified["model_state"])
     state = ckpt["state"]
     ckpt_mode = ckpt["input_mode"]
     args.input_mode = normalize_input_mode(args.input_mode or ckpt_mode)
@@ -124,36 +160,21 @@ def main(args):
         ids = tokenizer(prompts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(device)
         return text(ids)[0]
     modes = ["normal", "refs_equal_a", "refs_zero"] if args.run_all_ablations else [args.condition_ablation]
-    predictions = {m: [] for m in modes}
-    for mode in modes:
-        if args.input_mode == "single" and mode != "normal":
-            raise RuntimeError(f"{mode} is not applicable to single input_mode")
-        out_root = Path(args.output_dir, mode); out_root.mkdir(parents=True, exist_ok=True)
-        for batch in DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=focus_fusion_collate):
-            conditions = [x.to(device, dtype=dtype) for x in batch["conditions"]]
-            focus_maps = [x.to(device, dtype=dtype) for x in batch["focus_maps"]]
-            latent_overrides = {}
-            if mode != "normal":
-                if mode == "refs_equal_a":
-                    for i in range(1, len(conditions)):
-                        conditions[i] = conditions[0].clone()
-                    if args.input_mode == "ab_focus":
-                        focus_maps[1] = focus_maps[0].clone()
-                    with torch.no_grad():
-                        z_a = model.encode_images(conditions[0], mode=args.vae_encode_mode)[0]
-                    latent_overrides = {i: z_a for i in range(1, len(conditions))}
-                elif mode == "refs_zero":
-                    for i in range(1, len(conditions)):
-                        conditions[i] = torch.zeros_like(conditions[i])
-                    if args.input_mode == "ab_focus":
-                        focus_maps[1] = torch.zeros_like(focus_maps[1])
-                    with torch.no_grad():
-                        z_a = model.encode_images(conditions[0], mode=args.vae_encode_mode)[0]
-                    latent_overrides = {i: torch.zeros_like(z_a) for i in range(1, len(conditions))}
-            fa = focus_maps[0] if focus_maps else None
-            fb = focus_maps[1] if len(focus_maps) > 1 else None
-            with torch.no_grad(): raw, _, _ = model(conditions, fa, fb, embeds(batch["prompt"]), args.vae_encode_mode,
-                args.tiled, args.latent_tiled_size, args.latent_tiled_overlap, latent_overrides=latent_overrides)
+    stats = {"sum_equal": 0.0, "sum_zero": 0.0, "count": 0}
+    for batch in DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=focus_fusion_collate):
+        conditions = [x.to(device, dtype=dtype) for x in batch["conditions"]]
+        focus_maps = [x.to(device, dtype=dtype) for x in batch["focus_maps"]]
+        prompt = embeds(batch["prompt"])
+        base_latents = prepare_condition_latents(model, conditions, args.vae_encode_mode)
+        rendered = {}
+        for mode in modes:
+            if args.input_mode == "single" and mode != "normal":
+                raise RuntimeError(f"{mode} is not applicable to single input_mode")
+            _, save_focus_maps = ablation_latents_and_focus(args.input_mode, mode, base_latents, focus_maps)
+            fa = save_focus_maps[0] if save_focus_maps else None
+            raw = run_ablation_from_latents(model, args.input_mode, mode, base_latents, focus_maps, prompt, args)
+            rendered[mode] = raw
+            out_root = Path(args.output_dir, mode); out_root.mkdir(parents=True, exist_ok=True)
             final = raw
             if args.keep_a_composite:
                 keep_mask = soft_keep(fa, args.keep_threshold, args.keep_soft_width)
@@ -162,12 +183,12 @@ def main(args):
             images = {"pred_raw.png": _pil(raw), "final.png": _pil(final), "GT.png": _pil(batch["gt"])}
             for i, cond in enumerate(conditions):
                 images[f"{chr(ord('A') + i)}.png"] = _pil(cond)
-            for i, fmap in enumerate(focus_maps):
+            for i, fmap in enumerate(save_focus_maps):
                 images[f"focus_{i}.png"] = _pil(fmap, True)
             if args.keep_a_composite:
                 images["pred_keepa_composite.png"] = _pil(final)
             for name, image in images.items(): image.save(folder / name)
-            panel_names = [f"{chr(ord('A') + i)}.png" for i in range(len(conditions))] + ["GT.png"] + [f"focus_{i}.png" for i in range(len(focus_maps))] + ["pred_raw.png"]
+            panel_names = [f"{chr(ord('A') + i)}.png" for i in range(len(conditions))] + ["GT.png"] + [f"focus_{i}.png" for i in range(len(save_focus_maps))] + ["pred_raw.png"]
             if args.keep_a_composite:
                 panel_names.append("pred_keepa_composite.png")
             panels = [images[n].convert("RGB") for n in panel_names]
@@ -175,12 +196,21 @@ def main(args):
             x = 0
             for panel in panels: canvas.paste(panel, (x, 0)); x += panel.width
             canvas.save(folder / "comparison_A_B_GT_raw_keepa.png")
-            predictions[mode].append(raw.float().cpu())
+        if "normal" in rendered and "refs_equal_a" in rendered:
+            stats["sum_equal"] += float((rendered["normal"] - rendered["refs_equal_a"]).abs().mean().item())
+        if "normal" in rendered and "refs_zero" in rendered:
+            stats["sum_zero"] += float((rendered["normal"] - rendered["refs_zero"]).abs().mean().item())
+        stats["count"] += 1
+        del rendered, base_latents
     if len(modes) > 1:
-        normal = predictions["normal"]
-        stats = {f"normal_vs_{m}_mae": float(torch.cat([(x-y).abs().flatten() for x,y in zip(normal, predictions[m])]).mean()) for m in ("refs_equal_a", "refs_zero")}
-        print(json.dumps(stats, indent=2))
-        if min(stats.values()) < 1e-5: print("WARNING: ablation difference is near zero; the model may not use B")
+        out_stats = {
+            "normal_vs_refs_equal_a_mae": stats["sum_equal"] / max(stats["count"], 1),
+            "normal_vs_refs_zero_mae": stats["sum_zero"] / max(stats["count"], 1),
+            "sample_count": stats["count"],
+        }
+        print(json.dumps(out_stats, indent=2))
+        if min(out_stats["normal_vs_refs_equal_a_mae"], out_stats["normal_vs_refs_zero_mae"]) < 1e-5:
+            print("WARNING: ablation difference is near zero; the model may not use B")
 
 
 if __name__ == "__main__": main(parse_args())

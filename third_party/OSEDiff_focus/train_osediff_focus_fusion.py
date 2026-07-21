@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from dataloaders.focus_fusion_dataset import FocusFusionDataset, FIXED_FUSION_PROMPT, focus_fusion_collate
 from osediff_focus_fusion import (FocusFusionGenerator, checkpoint_payload, gradient_loss,
@@ -16,7 +17,7 @@ from osediff_focus_fusion import (FocusFusionGenerator, checkpoint_payload, grad
                                   load_vae_lora_state, load_vsd_lora_state,
                                   read_focus_checkpoint_config, load_focus_checkpoint,
                                   capture_rng_state, restore_rng_state,
-                                  write_checkpoint_complete_manifest)
+                                  write_checkpoint_atomically, load_verified_checkpoint)
 
 
 def parse_args(argv=None):
@@ -53,8 +54,10 @@ def parse_args(argv=None):
     p.add_argument("--lr_warmup_steps", type=int, default=500)
     p.add_argument("--lr_num_cycles", type=int, default=1)
     p.add_argument("--lr_power", type=float, default=1.0)
-    p.add_argument("--lora_rank_unet", type=int, default=4)
-    p.add_argument("--lora_rank", type=int, default=None)
+    p.add_argument("--lora_rank_unet", type=int, default=8)
+    p.add_argument("--lora_rank_vae", type=int, default=4)
+    p.add_argument("--lora_rank_vsd", type=int, default=8)
+    p.add_argument("--lora_rank", type=int, default=None, help="legacy compatibility only; prefer --lora_rank_unet/vae/vsd")
     p.add_argument("--train_conv_in", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--train_vae_lora", action="store_true")
     p.add_argument("--use_vsd", type=int, choices=[0, 1], default=0)
@@ -157,6 +160,8 @@ def validate_resume_config(args, resume_cfg):
     structural = {
         "input_mode": normalize_input_mode(getattr(args, "condition_mode", None) or args.input_mode),
         "generator_lora_rank": args.lora_rank_unet,
+        "vae_lora_rank": args.lora_rank_vae,
+        "vsd_lora_rank": args.lora_rank_vsd,
         "train_conv_in": args.train_conv_in,
         "train_vae_lora": args.train_vae_lora,
         "use_vsd": bool(args.use_vsd),
@@ -168,6 +173,8 @@ def validate_resume_config(args, resume_cfg):
             raise RuntimeError(f"resume structural parameter conflict: {name}: checkpoint={ckpt_value} CLI={cli_value}")
     args.input_mode = resume_cfg["input_mode"]
     args.lora_rank_unet = resume_cfg["generator_lora_rank"]
+    args.lora_rank_vae = resume_cfg["vae_lora_rank"]
+    args.lora_rank_vsd = resume_cfg["vsd_lora_rank"]
     args.train_conv_in = resume_cfg["train_conv_in"]
     args.train_vae_lora = resume_cfg["train_vae_lora"]
     args.use_vsd = int(resume_cfg["use_vsd"])
@@ -202,6 +209,68 @@ def resume_training_from_checkpoint(*, resume_state, optimizer, lr_scheduler, ac
     print(f"[RESUME] micro_steps_in_current_epoch {progress['micro_steps_in_current_epoch']}")
     print(f"[RESUME] dataloader batches skipped {progress['micro_steps_in_current_epoch']}")
     return progress
+
+
+def build_train_sampler(dataset, accelerator, args, epoch=0):
+    deterministic_shuffle = True
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=accelerator.num_processes,
+        rank=accelerator.process_index,
+        shuffle=deterministic_shuffle,
+        seed=args.seed,
+        drop_last=False,
+    )
+    sampler.set_epoch(epoch)
+    return sampler
+
+
+def run_training_loop(*, accelerator, model, train_dataloader, optimizer, lr_scheduler,
+                      max_train_steps, global_step=0, checkpointing_steps=0,
+                      validation_steps=0, compute_loss_fn=None, checkpoint_fn=None,
+                      validation_fn=None, max_grad_norm=None, current_epoch=0,
+                      batches_consumed_in_current_epoch=0, train_sampler=None):
+    """Shared optimizer-update loop used by formal training tests and main-like code."""
+    optimizer.zero_grad(set_to_none=True)
+    forward_micro_batches = backward_calls = optimizer_steps = scheduler_steps = 0
+    while global_step < max_train_steps:
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(current_epoch)
+        for batch_index, batch in enumerate(train_dataloader):
+            if batch_index < batches_consumed_in_current_epoch:
+                continue
+            with accelerator.accumulate(model):
+                loss = compute_loss_fn(model, batch) if compute_loss_fn else model(batch)
+                forward_micro_batches += 1
+                accelerator.backward(loss)
+                backward_calls += 1
+                if accelerator.sync_gradients:
+                    if max_grad_norm is not None:
+                        accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    optimizer_steps += 1
+                    scheduler_steps += 1
+                    global_step += 1
+            batches_consumed_in_current_epoch = batch_index + 1
+            if accelerator.sync_gradients:
+                if validation_steps and global_step % validation_steps == 0 and validation_fn:
+                    validation_fn(global_step)
+                if checkpointing_steps and global_step % checkpointing_steps == 0 and checkpoint_fn:
+                    checkpoint_fn(global_step)
+            if global_step >= max_train_steps:
+                break
+        current_epoch += 1
+        batches_consumed_in_current_epoch = 0
+    return {
+        "global_step": global_step,
+        "current_epoch": current_epoch,
+        "forward_micro_batches": forward_micro_batches,
+        "backward_calls": backward_calls,
+        "optimizer_steps": optimizer_steps,
+        "scheduler_steps": scheduler_steps,
+    }
 
 
 def _groups(model, args, vsd=None):
@@ -356,7 +425,8 @@ def main(args):
     if args.lora_rank is None:
         args.lora_rank = args.lora_rank_unet
     args.input_mode = normalize_input_mode(args.condition_mode or args.input_mode)
-    resume_cfg = read_focus_checkpoint_config(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
+    verified_resume = load_verified_checkpoint(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
+    resume_cfg = read_focus_checkpoint_config(verified_resume["model_state"]) if verified_resume else None
     validate_resume_config(args, resume_cfg)
     if args.input_mode != "ab_focus" and (args.lambda_keep or args.lambda_bref):
         print(f"WARNING: keep-A and B-reference losses are disabled for input_mode={args.input_mode}; no fake masks will be created")
@@ -377,7 +447,7 @@ def main(args):
     )
     vae_lora_targets = _add_vae_lora(
         vae,
-        resume_cfg["vae_lora_rank"] if resume_cfg else args.lora_rank_unet,
+        resume_cfg["vae_lora_rank"] if resume_cfg else args.lora_rank_vae,
         targets=resume_cfg["vae_lora_targets"] if resume_cfg else None,
         adapter_name=resume_cfg["vae_lora_adapter_name"] if resume_cfg else "focus_vae_encoder",
     ) if args.train_vae_lora else []
@@ -391,7 +461,10 @@ def main(args):
     model.focus_lora_targets = lora_targets
     model.lora_rank_unet = args.lora_rank_unet
     model.focus_vae_lora_targets = vae_lora_targets
-    model.lora_rank_vae = args.lora_rank_unet
+    model.generator_lora_rank = args.lora_rank_unet
+    model.vae_lora_rank = args.lora_rank_vae if args.train_vae_lora else None
+    model.vsd_lora_rank = args.lora_rank_vsd if args.use_vsd else None
+    model.lora_rank_vae = model.vae_lora_rank
     model.generator_lora_adapter_name = resume_cfg["generator_lora_adapter_name"] if resume_cfg else "focus_fusion"
     model.vae_lora_adapter_name = resume_cfg["vae_lora_adapter_name"] if resume_cfg else "focus_vae_encoder"
     model_reg = OSEDiff_reg(args=args, accelerator=accelerator) if args.use_vsd else None
@@ -401,7 +474,7 @@ def main(args):
         assert model_reg.unet_update.config.in_channels == 4
     resume_state = None
     if resume_cfg:
-        resume_state = load_focus_checkpoint(model, args.resume_from_checkpoint)
+        resume_state = load_focus_checkpoint(model, verified_resume["model_state"])
         load_vae_lora_state(model, resume_state)
         if model_reg is not None:
             load_vsd_lora_state(model_reg, resume_state)
@@ -430,7 +503,10 @@ def main(args):
     val_dataset = FocusFusionDataset(args.metadata_path, args.dataset_base_path, args.resolution,
         False, False, False, args.validation_max_samples, 0, False, args.prompt_mode,
         args.native_resolution, args.strict_native_size, args.input_mode, sf, args.max_pixels)
-    loader = DataLoader(dataset, args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers, collate_fn=focus_fusion_collate)
+    start_epoch_for_sampler = int(resume_state.get("sampler_epoch", resume_state.get("completed_epochs", 0))) if resume_state else 0
+    train_sampler = build_train_sampler(dataset, accelerator, args, start_epoch_for_sampler)
+    loader = DataLoader(dataset, args.train_batch_size, shuffle=False, sampler=train_sampler,
+                        num_workers=args.dataloader_num_workers, collate_fn=focus_fusion_collate)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=focus_fusion_collate)
     param_groups = _groups(model, args, model_reg)
     current_manifest = optimizer_group_manifest(param_groups)
@@ -448,6 +524,9 @@ def main(args):
         model, text_encoder, optimizer, loader, lr_scheduler = accelerator.prepare(model, text_encoder, optimizer, loader, lr_scheduler)
     else:
         model, model_reg, text_encoder, optimizer, loader, lr_scheduler = accelerator.prepare(model, model_reg, text_encoder, optimizer, loader, lr_scheduler)
+    if verified_resume:
+        accelerator.load_state(str(Path(verified_resume["checkpoint_dir"], "accelerator_state")))
+        print("[RESUME] accelerator state restored")
     resume_progress = resume_training_from_checkpoint(
         resume_state=resume_state,
         optimizer=optimizer,
@@ -461,6 +540,8 @@ def main(args):
     global_step = int(start)
     optimizer.zero_grad(set_to_none=True)
     while global_step < args.max_train_steps:
+        if hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(completed_epochs)
         micro_steps_in_current_epoch = 0
         for batch_idx, batch in enumerate(loader):
             if resume_micro_steps and batch_idx < resume_micro_steps:
@@ -529,19 +610,33 @@ def main(args):
                 if accelerator.is_main_process and args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
                     raw = accelerator.unwrap_model(model)
                     raw_reg = accelerator.unwrap_model(model_reg) if model_reg is not None else None
-                    final_path = Path(args.output_dir, "checkpoints", f"focus_fusion_{global_step}.pt")
+                    checkpoint_dir = Path(args.output_dir, "checkpoints", f"checkpoint-{global_step:08d}")
+                    accelerator_state_dir = checkpoint_dir / "accelerator_state"
+                    accelerator_state_dir.mkdir(parents=True, exist_ok=True)
+                    accelerator.save_state(str(accelerator_state_dir))
                     payload = checkpoint_payload(
                         raw, global_step, args, optimizer, lr_scheduler, raw_reg, accelerator,
                         optimizer_group_manifest=current_manifest,
                         completed_epochs=completed_epochs,
                         micro_steps_in_current_epoch=micro_steps_in_current_epoch,
                         dataloader_position=micro_steps_in_current_epoch,
+                        sampler_epoch=completed_epochs,
                     )
-                    with tempfile.NamedTemporaryFile(dir=final_path.parent, suffix=".tmp", delete=False) as tmp:
-                        tmp_path = Path(tmp.name)
-                    torch.save(payload, tmp_path)
-                    os.replace(tmp_path, final_path)
-                    write_checkpoint_complete_manifest(final_path, payload)
+                    trainer_state = {
+                        "global_step": global_step,
+                        "current_epoch": completed_epochs,
+                        "completed_epochs": completed_epochs,
+                        "batches_consumed_in_current_epoch": micro_steps_in_current_epoch,
+                        "sampler_seed": args.seed,
+                        "sampler_epoch": completed_epochs,
+                        "dataset_length": len(dataset),
+                        "world_size": accelerator.num_processes,
+                        "process_count": accelerator.num_processes,
+                        "train_batch_size": args.train_batch_size,
+                        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                        "drop_last": False,
+                    }
+                    write_checkpoint_atomically(checkpoint_dir, payload, trainer_state, current_manifest, accelerator_state_present=True)
                 if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
                     accelerator.wait_for_everyone()
                 if global_step >= args.max_train_steps:
